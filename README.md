@@ -1,2 +1,2 @@
 # cfn-project
-CFN_Modulation
+Use Conservertaive Form Network to predict or recover modulaton equations
