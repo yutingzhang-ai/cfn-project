@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cfn"
+version = "0.1.0"
+description = "Conservative Flux Network for learning 1D conservation-law fluxes."
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.23,<2",
+    "scipy>=1.10",
+    "torch>=2.0",
+    "matplotlib>=3.6",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-cov", "ruff"]
+
+[tool.setuptools.packages.find]
+include = ["cfn*"]
+exclude = ["tests*", "scripts*", "configs*", "data*", "notebooks*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

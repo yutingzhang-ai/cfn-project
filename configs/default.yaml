@@ -1,0 +1,25 @@
+# Default training configuration (matches the first training run from the notebook).
+data: data/one_traj_loss_check.npy
+out_dir: runs/run_default
+
+features: [64, 64, 64, 64, 1]
+dt: 0.03125              # 100 / 3200
+dx: 0.4
+
+epochs: 66
+lr: 2.0e-3
+early_stop_patience: 60
+lr_patience: 10
+tol: 1.0e-9
+
+margin: 16
+window_t: 700
+window_x: 80
+num_samples: 126
+L: 160
+rollout_steps: 4
+num_draws: 3
+
+use_smooth: false
+lambda_smooth: 1.0e-4
+seed: 0

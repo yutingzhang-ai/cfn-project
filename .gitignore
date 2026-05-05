@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Data and runs are kept out of source control
+data/*.npy
+runs/
+*.pt
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
