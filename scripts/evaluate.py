@@ -7,8 +7,9 @@ Changes vs. the original
    Pass --integrator rk3 to restore the previous behaviour.
 
 2. Flux alignment subtracts the midpoint difference between learned and
-   analytical curves. Both are sampled at the same u-grid (interface
-   midpoints), so alignment is exact — no half-grid offset.
+   analytical curves. Both are sampled at the same u-grid (cell centers,
+   with the learned flux averaged from its two bracketing interfaces),
+   so alignment is exact — no half-grid offset.
 """
 
 from __future__ import annotations
@@ -66,18 +67,20 @@ def load_model(state_path, features, dt, dx, device) -> CFN:
 
 # --- cropping & alignment ------------------------------------------------
 
-def crop_to_interface_midpoints(u_full, flux_full, pad):
-    """Return (u_mid, flux) of equal length, sampled at interface midpoints.
+def crop_to_interface_midpoints(
+    u_full: np.ndarray, flux_full: np.ndarray, pad: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (u, flux) of equal length, with flux averaged from surrounding interfaces.
 
-    u_full has Nx cell centers; flux_full has Nx+1 interface values.
-    After cropping pad from each side and trimming the trailing flux interface,
-    we evaluate u at the midpoints of each retained cell pair so the two
-    arrays share an identical u-grid.
+    ``u_full`` has Nx cell centers; ``flux_full`` has Nx + 1 interfaces.
+    For each kept cell i in [pad, Nx - pad), the cell-centered flux is the
+    average of its two bracketing interfaces flux_full[i] and flux_full[i+1].
+    Both returned arrays have length Nx - 2*pad and share the same u-grid,
+    so midpoint-difference alignment is exact.
     """
-    u_cropped = u_full[pad:-pad]                 # length Nx - 2*pad
-    flux_cropped = flux_full[pad:-pad][:-1]      # length Nx - 2*pad - 1
-    u_mid = 0.5 * (u_cropped[:-1] + u_cropped[1:])  # length Nx - 2*pad - 1
-    return u_mid, flux_cropped
+    u_at_centers = u_full[pad:-pad]
+    flux_at_centers = 0.5 * (flux_full[pad:-pad - 1] + flux_full[pad + 1:-pad])
+    return u_at_centers, flux_at_centers
 
 
 def align_by_midpoint(learned, reference):
@@ -265,12 +268,9 @@ def main():
         flux_full    = flux.detach().cpu().numpy().flatten()
         dfdu_full    = dfdu_auto.detach().cpu().numpy().flatten()
 
-        # Flux on interface midpoints (length N - 2*pad - 1).
+        # All quantities evaluated at cell centers (length N - 2*pad).
         u_mid_n, flux_np = crop_to_interface_midpoints(u_centers_np, flux_full, pad)
-
-        # dF/du from autograd lives at cell centers; average to interface midpoints.
-        dfdu_centers = dfdu_full[pad:-pad]                              # length N - 2*pad
-        dfdu_auto_np = 0.5 * (dfdu_centers[:-1] + dfdu_centers[1:])     # length N - 2*pad - 1
+        dfdu_auto_np = dfdu_full[pad:-pad]
 
         flux_true_raw = flux_function(u_mid_n)
         flux_true, _ = align_by_midpoint(flux_np, flux_true_raw)
