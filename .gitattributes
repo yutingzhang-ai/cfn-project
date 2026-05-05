@@ -1,2 +1,8 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Python: keep LF so diffs are stable on Windows checkouts
+*.py text eol=lf
+
+# Keep this file LF so line-ending-only diffs do not appear on Windows
+.gitattributes text eol=lf
