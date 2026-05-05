@@ -12,6 +12,16 @@ import torch.nn as nn
 from cfn.data import build_epoch_dataset
 
 
+def _resolve_step_fn(model: nn.Module, integrator: str) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Return the model's per-step function for the named integrator."""
+    name = integrator.lower()
+    if name == "euler":
+        return model.euler
+    if name in ("rk3", "tvd_rk3", "tvdrk3"):
+        return model.TVD_RK3
+    raise ValueError(f"Unknown integrator {integrator!r}; expected 'euler' or 'rk3'.")
+
+
 def apply_model(
     model: nn.Module,
     un: torch.Tensor,
@@ -26,12 +36,13 @@ def apply_model(
     lambda_smooth: float = 0.0,
     use_smooth: bool = False,
     rollout_steps: int | None = 9,
+    integrator: str = "euler",
 ) -> tuple[float, list[float]]:
     """Roll the model out and accumulate loss against future snapshots.
 
-    For each of ``rollout_steps`` targets, take ``k`` Euler steps from the
-    current state, compare interior region (excluding ``margin`` points on
-    each boundary) against the matching snapshot, and accumulate MSE.
+    For each of ``rollout_steps`` targets, take ``k`` integrator steps from
+    the current state, compare interior region (excluding ``margin`` points
+    on each boundary) against the matching snapshot, and accumulate MSE.
 
     Parameters
     ----------
@@ -39,11 +50,15 @@ def apply_model(
         If True, add ``lambda_smooth * mean((d/dx)(dF/du))^2`` per step.
     rollout_steps : int or None
         Number of supervised future points; ``None`` uses ``u_np1.shape[1]``.
+    integrator : {"euler", "rk3"}
+        Per-step time integrator. ``"rk3"`` uses TVD-RK3 (Shu-Osher).
     """
     optimizer.zero_grad()
 
     if rollout_steps is None:
         rollout_steps = int(u_np1.shape[1])
+
+    step_fn = _resolve_step_fn(model, integrator)
 
     loss = torch.tensor(0.0, device=un.device)
     loss_list: list[float] = []
@@ -51,7 +66,7 @@ def apply_model(
 
     for target_id in range(rollout_steps):
         for _ in range(k):
-            um = model.euler(um)
+            um = step_fn(um)
 
         pred = um[:, margin:-margin, :]
         target = u_np1[:, target_id, margin:-margin, :]
@@ -96,6 +111,7 @@ def train_epoch(
     use_smooth: bool = False,
     rollout_steps: int = 9,
     num_draws: int = 5,
+    integrator: str = "euler",
 ) -> float:
     """Run ``num_draws`` independent random-window draws as one 'epoch'."""
     model.train()
@@ -120,6 +136,7 @@ def train_epoch(
             lambda_smooth=lambda_smooth,
             use_smooth=use_smooth,
             rollout_steps=rollout_steps,
+            integrator=integrator,
         )
         total_loss += loss
 
@@ -147,18 +164,28 @@ def train_CFN(
     L: int = 160,
     rollout_steps: int = 9,
     num_draws: int = 5,
+    integrator: str = "euler",
     verbose: bool = True,
-) -> tuple[nn.Module, list[float]]:
+) -> tuple[nn.Module, list[float], dict]:
     """Train CFN with ReduceLROnPlateau, early stopping, and auto-smooth.
 
     The smoothness penalty is automatically enabled the first time the
     learning rate is reduced — under the heuristic that the network is
     near-converged on data fit and should now regularise its flux derivative.
+
+    Returns
+    -------
+    model, loss_history, info
+        ``info`` is a dict with ``epochs_run``, ``best_loss``, ``final_lr``,
+        ``use_smooth_enabled``, ``early_stopped`` — useful for run summaries.
     """
     best_model = copy.deepcopy(model)
     best_loss = float("inf")
     no_improve = 0
     loss_history: list[float] = []
+    smooth_enabled_input = bool(use_smooth)
+    early_stopped = False
+    epoch = 0
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=lr_factor, patience=lr_patience, threshold=tol
@@ -173,6 +200,7 @@ def train_CFN(
             L=L, margin=margin,
             lambda_smooth=lambda_smooth, use_smooth=use_smooth,
             rollout_steps=rollout_steps, num_draws=num_draws,
+            integrator=integrator,
         )
         loss_history.append(loss_val)
 
@@ -196,9 +224,20 @@ def train_CFN(
             no_improve += 1
 
         if no_improve >= early_stop_patience:
+            early_stopped = True
             if verbose:
                 print(f"Early stopping at epoch {epoch}")
             break
 
     model.load_state_dict(best_model.state_dict())
-    return model, loss_history
+
+    info = {
+        "epochs_run": epoch + 1 if loss_history else 0,
+        "best_loss": float(best_loss) if best_loss != float("inf") else None,
+        "final_lr": float(optimizer.param_groups[0]["lr"]),
+        "use_smooth_input": smooth_enabled_input,
+        "use_smooth_enabled": bool(use_smooth),
+        "early_stopped": early_stopped,
+        "integrator": integrator,
+    }
+    return model, loss_history, info

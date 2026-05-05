@@ -10,7 +10,7 @@ or
 from __future__ import annotations
 
 import argparse
-import math
+import json
 from pathlib import Path
 
 import numpy as np
@@ -53,6 +53,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use-smooth", action="store_true")
     p.add_argument("--lambda-smooth", type=float, default=1e-4)
 
+    p.add_argument(
+        "--integrator",
+        choices=["euler", "rk3"],
+        default="euler",
+        help="Per-step integrator used during training rollouts.",
+    )
+
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -81,6 +88,11 @@ def main() -> None:
     out_dir = Path(cfg["out_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Persist the resolved config so evaluate.py can pick up model/physics
+    # parameters automatically.  Paths are stringified for YAML round-tripping.
+    cfg_to_save = {k: (str(v) if isinstance(v, Path) else v) for k, v in cfg.items()}
+    (out_dir / "config.yaml").write_text(yaml.safe_dump(cfg_to_save, sort_keys=True))
+
     torch.manual_seed(cfg["seed"])
     np.random.seed(cfg["seed"])
 
@@ -100,7 +112,7 @@ def main() -> None:
     # Save initial model for later before/after comparisons
     torch.save(model.state_dict(), out_dir / "model_init.pt")
 
-    trained, history = train_CFN(
+    trained, history, info = train_CFN(
         model,
         phi_xt,
         loss_fn,
@@ -119,11 +131,13 @@ def main() -> None:
         num_draws=cfg["num_draws"],
         use_smooth=cfg["use_smooth"],
         lambda_smooth=cfg["lambda_smooth"],
+        integrator=cfg.get("integrator", "euler"),
     )
 
     torch.save(trained.state_dict(), out_dir / "model_trained.pt")
     np.save(out_dir / "loss_history.npy", np.asarray(history))
-    print(f"Saved model + loss history to {out_dir}/")
+    (out_dir / "train_summary.json").write_text(json.dumps(info, indent=2))
+    print(f"Saved model + loss history + summary to {out_dir}/")
 
 
 if __name__ == "__main__":

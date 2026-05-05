@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 
 from cfn import CFN
 from cfn.data import build_epoch_dataset
-import numpy as np
 
 
 def test_cfn_forward_shapes():

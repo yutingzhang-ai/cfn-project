@@ -24,3 +24,15 @@ exclude = ["tests*", "scripts*", "configs*", "data*", "notebooks*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+extend-exclude = ["runs", "data", "notebooks"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+ignore = [
+    "E501",  # line length is enforced loosely; long math lines are common
+    "E731",  # lambda assignments are fine in research code
+]

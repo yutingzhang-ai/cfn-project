@@ -1,8 +1,27 @@
 # Auto detect text files and perform LF normalization
 * text=auto
 
-# Python: keep LF so diffs are stable on Windows checkouts
-*.py text eol=lf
+# Force LF on common text formats so line-ending-only diffs do not appear
+# on Windows checkouts.
+*.py        text eol=lf
+*.md        text eol=lf
+*.yaml      text eol=lf
+*.yml       text eol=lf
+*.toml      text eol=lf
+*.txt       text eol=lf
+*.json      text eol=lf
+*.cfg       text eol=lf
+*.ini       text eol=lf
+*.csv       text eol=lf
 
-# Keep this file LF so line-ending-only diffs do not appear on Windows
-.gitattributes text eol=lf
+# Dotfiles (no extension)
+.gitignore       text eol=lf
+.gitattributes   text eol=lf
+
+# Binary artefacts: never touch line endings
+*.pt    binary
+*.npy   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary

@@ -22,4 +22,5 @@ num_draws: 6
 
 use_smooth: false
 lambda_smooth: 1.0e-4
+integrator: euler
 seed: 0

@@ -22,4 +22,5 @@ num_draws: 3
 
 use_smooth: false
 lambda_smooth: 1.0e-4
+integrator: euler        # 'euler' or 'rk3' (TVD-RK3); CLI --integrator overrides
 seed: 0
