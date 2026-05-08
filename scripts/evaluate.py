@@ -207,16 +207,8 @@ def main():
     plt.close()
 
     # ---- 2. Single-resolution flux comparison ----
-   u_crop_left = 0.04
-   u_crop_right = 0.08
-
-   u_centers = torch.linspace(args.u_min + u_crop_left,
-                              args.u_max - u_crop_right,
-                              100,
-                              dtype=torch.float32,
-                              device=device).view(1, -1, 1)
-
-    
+    u_centers = torch.linspace(args.u_min, args.u_max, 100,
+                               dtype=torch.float32, device=device).view(1, -1, 1)
     with torch.no_grad():
         flux_before_full = model_init.num_flux(u_centers).cpu().numpy().flatten()
         flux_after_full  = model_trained.num_flux(u_centers).cpu().numpy().flatten()
@@ -235,46 +227,76 @@ def main():
     dfdu_before = np.gradient(flux_before, u_mid)
     dfdu_after  = np.gradient(flux_after,  u_mid)
 
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    axes[0].plot(u_mid, flux_before, label="before")
-    axes[0].plot(u_mid, flux_after,  label="after")
-    axes[0].plot(u_mid, flux_true, "--", label="analytical (aligned)")
-    axes[0].axvline(anchor_u, color="grey", lw=0.5, alpha=0.5)
-    axes[0].set_title("Flux comparison (cropped, midpoint-aligned)")
-    axes[0].set_xlabel("u")
-    axes[0].legend()
+    err_flux = float(np.sqrt(np.mean((flux_after - flux_true) ** 2)))
+    err_dfdu = float(np.sqrt(np.mean((dfdu_after - dfdu_true) ** 2)))
 
-    axes[1].plot(u_mid, dfdu_before, label="df/du before")
-    axes[1].plot(u_mid, dfdu_after,  label="df/du after")
-    axes[1].plot(u_mid, dfdu_true, "--", label="df/du analytical")
-    axes[1].set_title("Derivative comparison (cropped)")
-    axes[1].set_xlabel("u")
-    axes[1].legend()
+    INTERIOR_LO, INTERIOR_HI = 0.73, 0.84
+    interior_mask = (u_mid >= INTERIOR_LO) & (u_mid <= INTERIOR_HI)
+    u_int          = u_mid[interior_mask]
+    flux_before_i  = flux_before[interior_mask]
+    flux_after_i   = flux_after[interior_mask]
+    flux_true_i    = flux_true[interior_mask]
+    dfdu_before_i  = dfdu_before[interior_mask]
+    dfdu_after_i   = dfdu_after[interior_mask]
+    dfdu_true_i    = dfdu_true[interior_mask]
+
+    err_flux_int = float(np.sqrt(np.mean((flux_after_i - flux_true_i) ** 2)))
+    err_dfdu_int = float(np.sqrt(np.mean((dfdu_after_i - dfdu_true_i) ** 2)))
+
+    print(f"Flux RMSE       (full {u_mid[0]:.3f}-{u_mid[-1]:.3f}): {err_flux:.4e}")
+    print(f"Derivative RMSE (full {u_mid[0]:.3f}-{u_mid[-1]:.3f}): {err_dfdu:.4e}")
+    print(f"Flux RMSE       (interior {INTERIOR_LO}-{INTERIOR_HI}, n={interior_mask.sum()}): {err_flux_int:.4e}")
+    print(f"Derivative RMSE (interior {INTERIOR_LO}-{INTERIOR_HI}, n={interior_mask.sum()}): {err_dfdu_int:.4e}")
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
+
+    # --- Top row: full evaluated range ---
+    axes[0, 0].plot(u_mid, flux_before, label="before")
+    axes[0, 0].plot(u_mid, flux_after,  label="after")
+    axes[0, 0].plot(u_mid, flux_true, "--", label="analytical (aligned)")
+    axes[0, 0].axvline(anchor_u, color="grey", lw=0.5, alpha=0.5)
+    axes[0, 0].set_title(f"Flux — full range (RMSE={err_flux:.2e})")
+    axes[0, 0].set_xlabel("u")
+    axes[0, 0].legend()
+
+    axes[0, 1].plot(u_mid, dfdu_before, label="df/du before")
+    axes[0, 1].plot(u_mid, dfdu_after,  label="df/du after")
+    axes[0, 1].plot(u_mid, dfdu_true, "--", label="df/du analytical")
+    axes[0, 1].set_title(f"Derivative — full range (RMSE={err_dfdu:.2e})")
+    axes[0, 1].set_xlabel("u")
+    axes[0, 1].legend()
+
+    # --- Bottom row: interior range [0.73, 0.84] ---
+    axes[1, 0].plot(u_int, flux_before_i, label="before")
+    axes[1, 0].plot(u_int, flux_after_i,  label="after")
+    axes[1, 0].plot(u_int, flux_true_i, "--", label="analytical (aligned)")
+    axes[1, 0].set_title(f"Flux — interior [{INTERIOR_LO}, {INTERIOR_HI}] (RMSE={err_flux_int:.2e})")
+    axes[1, 0].set_xlabel("u")
+    axes[1, 0].legend()
+
+    axes[1, 1].plot(u_int, dfdu_before_i, label="df/du before")
+    axes[1, 1].plot(u_int, dfdu_after_i,  label="df/du after")
+    axes[1, 1].plot(u_int, dfdu_true_i, "--", label="df/du analytical")
+    axes[1, 1].set_title(f"Derivative — interior [{INTERIOR_LO}, {INTERIOR_HI}] (RMSE={err_dfdu_int:.2e})")
+    axes[1, 1].set_xlabel("u")
+    axes[1, 1].legend()
+
     fig.tight_layout()
     fig.savefig(args.run_dir / "flux_comparison.png", dpi=150)
     plt.close(fig)
 
-    err_flux = float(np.sqrt(np.mean((flux_after - flux_true) ** 2)))
-    err_dfdu = float(np.sqrt(np.mean((dfdu_after - dfdu_true) ** 2)))
-    print(f"Flux RMSE:       {err_flux:.4e}")
-    print(f"Derivative RMSE: {err_dfdu:.4e}")
-
-    metrics_rows = [("single", 100, err_flux, err_dfdu)]
+    metrics_rows = [
+        ("single_full",     100, err_flux,     err_dfdu),
+        ("single_interior", int(interior_mask.sum()), err_flux_int, err_dfdu_int),
+    ]
 
     # ---- 3. Multi-resolution comparison ----
     res_list = [30, 100, 300]
     fig, axes = plt.subplots(len(res_list), 2, figsize=(10, 4 * len(res_list)))
 
     for i, N in enumerate(res_list):
-     
-
-        u_centers = torch.linspace(args.u_min + u_crop_left,
-                           args.u_max - u_crop_right,
-                           100,
-                           dtype=torch.float32,
-                           device=device).view(1, -1, 1)
-       
-        
+        u_centers = torch.linspace(args.u_min, args.u_max, N,
+                                   dtype=torch.float32, device=device).view(1, -1, 1)
         u_centers.requires_grad_(True)
         flux = model_trained.num_flux(u_centers)
         dfdu_auto = torch.autograd.grad(flux.sum(), u_centers, create_graph=False)[0]
