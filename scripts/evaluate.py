@@ -39,6 +39,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--u-max", type=float, default=0.88)
     p.add_argument("--pad", type=int, default=3)
     p.add_argument("--rollout-snapshots", type=int, default=4)
+    p.add_argument("--eval-L", type=int, default=None,
+                   help="Steps between rollout snapshots at evaluation time. "
+                        "Overrides config 'L'. Larger = longer rollout per snapshot.")
     p.add_argument("--integrator", choices=["euler", "rk3"], default="euler",
                    help="Integrator for rollout comparison (default: euler).")
     return p.parse_args()
@@ -98,7 +101,7 @@ def central_diff(f, u, eps=1e-4):
 # --- rollout -------------------------------------------------------------
 
 def do_rollout_comparison(model, run_cfg, dt, dx, n_snapshots, device, out_path,
-                          integrator="euler"):
+                          integrator="euler", eval_L=None):
     from cfn.solvers import euler_numpy, tvd_rk3_numpy
 
     if integrator == "euler":
@@ -117,8 +120,9 @@ def do_rollout_comparison(model, run_cfg, dt, dx, n_snapshots, device, out_path,
         print("Skipping rollout comparison: no resolvable data path.")
         return None
 
-    L = int(run_cfg.get("L", 160))
+    L = int(eval_L if eval_L is not None else run_cfg.get("L", 160))
     margin = int(run_cfg.get("margin", 16))
+    dt_per_snap = L * dt
 
     traj = np.load(data_path)
     if traj.ndim != 4:
@@ -142,7 +146,8 @@ def do_rollout_comparison(model, run_cfg, dt, dx, n_snapshots, device, out_path,
     x = np.arange(Nx)
     interior = slice(margin, Nx - margin) if margin > 0 else slice(None)
 
-    print(f"Rollout comparison using integrator={integrator!r}")
+    print(f"Rollout comparison using integrator={integrator!r}, "
+          f"L={L} steps/snapshot, dt={dt}, t/snapshot={dt_per_snap:.4g}")
     for k in range(1, n_snapshots + 1):
         for _ in range(L):
             u_np = np_step(u_np, dt, dx)
@@ -151,6 +156,7 @@ def do_rollout_comparison(model, run_cfg, dt, dx, n_snapshots, device, out_path,
 
         u_cfn_np = u_torch[0, :, 0].cpu().numpy()
         u_data = traj[0, k * L, :, 0]
+        t_phys = k * dt_per_snap
 
         ax = axes[k - 1, 0]
         ax.plot(x, u_data, "k-",  lw=1.2, label="data")
@@ -159,7 +165,7 @@ def do_rollout_comparison(model, run_cfg, dt, dx, n_snapshots, device, out_path,
         if margin > 0:
             ax.axvspan(0, margin, color="grey", alpha=0.1)
             ax.axvspan(Nx - margin, Nx, color="grey", alpha=0.1)
-        ax.set_title(f"Rollout snapshot k={k}  (after {k * L} model steps)")
+        ax.set_title(f"Rollout snapshot k={k}  (t={t_phys:.3g}, {k * L} model steps)")
         ax.set_xlabel("cell index")
         ax.set_ylabel("u")
         ax.legend(loc="upper right", fontsize="x-small")
@@ -167,7 +173,7 @@ def do_rollout_comparison(model, run_cfg, dt, dx, n_snapshots, device, out_path,
         r_np  = float(np.sqrt(np.mean((u_np[0, interior] - u_data[interior]) ** 2)))
         r_cfn = float(np.sqrt(np.mean((u_cfn_np[interior]  - u_data[interior]) ** 2)))
         rmse_rows.append((k, r_np, r_cfn))
-        print(f"  rollout k={k:>2}: numpy_RMSE={r_np:.4e}  cfn_RMSE={r_cfn:.4e}")
+        print(f"  rollout k={k:>2} (t={t_phys:>7.3g}): numpy_RMSE={r_np:.4e}  cfn_RMSE={r_cfn:.4e}")
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
@@ -342,6 +348,7 @@ def main():
         n_snapshots=args.rollout_snapshots, device=device,
         out_path=args.run_dir / "rollout_comparison.png",
         integrator=args.integrator,
+        eval_L=args.eval_L,
     )
 
     # ---- 5. Persist metrics ----
