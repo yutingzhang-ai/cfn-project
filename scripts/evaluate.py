@@ -207,8 +207,16 @@ def main():
     plt.close()
 
     # ---- 2. Single-resolution flux comparison ----
-    u_centers = torch.linspace(args.u_min, args.u_max, 100,
-                               dtype=torch.float32, device=device).view(1, -1, 1)
+   u_crop_left = 0.04
+   u_crop_right = 0.08
+
+   u_centers = torch.linspace(args.u_min + u_crop_left,
+                              args.u_max - u_crop_right,
+                              100,
+                              dtype=torch.float32,
+                              device=device).view(1, -1, 1)
+
+    
     with torch.no_grad():
         flux_before_full = model_init.num_flux(u_centers).cpu().numpy().flatten()
         flux_after_full  = model_trained.num_flux(u_centers).cpu().numpy().flatten()
@@ -258,8 +266,15 @@ def main():
     fig, axes = plt.subplots(len(res_list), 2, figsize=(10, 4 * len(res_list)))
 
     for i, N in enumerate(res_list):
-        u_centers = torch.linspace(args.u_min, args.u_max, N,
-                                   dtype=torch.float32, device=device).view(1, -1, 1)
+     
+
+        u_centers = torch.linspace(args.u_min + u_crop_left,
+                           args.u_max - u_crop_right,
+                           100,
+                           dtype=torch.float32,
+                           device=device).view(1, -1, 1)
+       
+        
         u_centers.requires_grad_(True)
         flux = model_trained.num_flux(u_centers)
         dfdu_auto = torch.autograd.grad(flux.sum(), u_centers, create_graph=False)[0]
