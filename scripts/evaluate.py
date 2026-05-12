@@ -1,21 +1,32 @@
 """Evaluate a trained CFN against the theoretical Whitham flux.
 
-Changes vs. the original
-------------------------
-1. Rollout comparison uses **forward Euler** for both the NumPy reference
-   and the CFN by default, matching the default training-time integrator.
-   Pass --integrator rk3 to restore the previous behaviour.
+Supports:
+- single default rollout dataset via config["data"]
+- multiple rollout datasets via config["rollout_datasets"]
 
-2. Flux alignment subtracts the midpoint difference between learned and
-   analytical curves. Both are sampled at the same u-grid (cell centers,
-   with the learned flux averaged from its two bracketing interfaces),
-   so alignment is exact — no half-grid offset.
+Each rollout dataset can have:
+    name, path, L, margin
+
+Example config:
+{
+    "data": "runs/run_colab/phi_xt_1.npy",
+    "rollout_datasets": [
+        {"name": "dataset_1", "path": "runs/run_colab/phi_xt_1.npy", "L": 160, "margin": 16},
+        {"name": "dataset_2", "path": "runs/run_colab/phi_xt_2.npy", "L": 160, "margin": 16},
+    ],
+    "features": [64, 64, 64, 64, 1],
+    "dt": 100/3200,
+    "dx": 0.4,
+    "L": 160,
+    "margin": 16,
+}
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import shutil
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -25,6 +36,7 @@ import yaml
 
 from cfn import CFN
 from cfn.theoretical import flux_function
+
 
 # --- args / config -------------------------------------------------------
 
@@ -39,9 +51,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--u-max", type=float, default=0.88)
     p.add_argument("--pad", type=int, default=3)
     p.add_argument("--rollout-snapshots", type=int, default=4)
-    p.add_argument("--eval-L", type=int, default=None,
-                   help="Steps between rollout snapshots at evaluation time. "
-                        "Overrides config 'L'. Larger = longer rollout per snapshot.")
     p.add_argument("--integrator", choices=["euler", "rk3"], default="euler",
                    help="Integrator for rollout comparison (default: euler).")
     return p.parse_args()
@@ -68,6 +77,11 @@ def load_model(state_path, features, dt, dx, device) -> CFN:
     return model
 
 
+def sanitize_filename(name: str) -> str:
+    """Make a string safe for use as a filename component."""
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+
+
 # --- cropping & alignment ------------------------------------------------
 
 def crop_to_interface_midpoints(
@@ -75,7 +89,7 @@ def crop_to_interface_midpoints(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return (u, flux) of equal length, with flux averaged from surrounding interfaces.
 
-    ``u_full`` has Nx cell centers; ``flux_full`` has Nx + 1 interfaces.
+    u_full has Nx cell centers; flux_full has Nx + 1 interfaces.
     For each kept cell i in [pad, Nx - pad), the cell-centered flux is the
     average of its two bracketing interfaces flux_full[i] and flux_full[i+1].
     Both returned arrays have length Nx - 2*pad and share the same u-grid,
@@ -100,8 +114,8 @@ def central_diff(f, u, eps=1e-4):
 
 # --- rollout -------------------------------------------------------------
 
-def do_rollout_comparison(model, run_cfg, dt, dx, n_snapshots, device, out_path,
-                          integrator="euler", eval_L=None):
+def do_rollout_comparison(model, dt, dx, n_snapshots, device, out_path,
+                          data_path, L, margin, integrator="euler"):
     from cfn.solvers import euler_numpy, tvd_rk3_numpy
 
     if integrator == "euler":
@@ -115,14 +129,10 @@ def do_rollout_comparison(model, run_cfg, dt, dx, n_snapshots, device, out_path,
         print("Skipping rollout comparison (--rollout-snapshots <= 0).")
         return None
 
-    data_path = run_cfg.get("data") if run_cfg else None
-    if not data_path or not Path(data_path).exists():
-        print("Skipping rollout comparison: no resolvable data path.")
+    data_path = Path(data_path)
+    if not data_path.exists():
+        print(f"Skipping rollout comparison: data path does not exist: {data_path}")
         return None
-
-    L = int(eval_L if eval_L is not None else run_cfg.get("L", 160))
-    margin = int(run_cfg.get("margin", 16))
-    dt_per_snap = L * dt
 
     traj = np.load(data_path)
     if traj.ndim != 4:
@@ -146,8 +156,7 @@ def do_rollout_comparison(model, run_cfg, dt, dx, n_snapshots, device, out_path,
     x = np.arange(Nx)
     interior = slice(margin, Nx - margin) if margin > 0 else slice(None)
 
-    print(f"Rollout comparison using integrator={integrator!r}, "
-          f"L={L} steps/snapshot, dt={dt}, t/snapshot={dt_per_snap:.4g}")
+    print(f"Rollout comparison using integrator={integrator!r} on {data_path}")
     for k in range(1, n_snapshots + 1):
         for _ in range(L):
             u_np = np_step(u_np, dt, dx)
@@ -156,29 +165,92 @@ def do_rollout_comparison(model, run_cfg, dt, dx, n_snapshots, device, out_path,
 
         u_cfn_np = u_torch[0, :, 0].cpu().numpy()
         u_data = traj[0, k * L, :, 0]
-        t_phys = k * dt_per_snap
 
         ax = axes[k - 1, 0]
         ax.plot(x, u_data, "k-",  lw=1.2, label="data")
-        ax.plot(x, u_np[0],"b--", lw=1.0, label=f"numpy ref ({integrator})")
-        ax.plot(x, u_cfn_np,"r:", lw=1.2, label=f"CFN ({integrator})")
+        ax.plot(x, u_np[0], "b--", lw=1.0, label=f"numpy ref ({integrator})")
+        ax.plot(x, u_cfn_np, "r:", lw=1.2, label=f"CFN ({integrator})")
         if margin > 0:
             ax.axvspan(0, margin, color="grey", alpha=0.1)
             ax.axvspan(Nx - margin, Nx, color="grey", alpha=0.1)
-        ax.set_title(f"Rollout snapshot k={k}  (t={t_phys:.3g}, {k * L} model steps)")
+        ax.set_title(f"Rollout snapshot k={k}  (after {k * L} model steps)")
         ax.set_xlabel("cell index")
         ax.set_ylabel("u")
         ax.legend(loc="upper right", fontsize="x-small")
 
-        r_np  = float(np.sqrt(np.mean((u_np[0, interior] - u_data[interior]) ** 2)))
-        r_cfn = float(np.sqrt(np.mean((u_cfn_np[interior]  - u_data[interior]) ** 2)))
+        r_np = float(np.sqrt(np.mean((u_np[0, interior] - u_data[interior]) ** 2)))
+        r_cfn = float(np.sqrt(np.mean((u_cfn_np[interior] - u_data[interior]) ** 2)))
         rmse_rows.append((k, r_np, r_cfn))
-        print(f"  rollout k={k:>2} (t={t_phys:>7.3g}): numpy_RMSE={r_np:.4e}  cfn_RMSE={r_cfn:.4e}")
+        print(f"  rollout k={k:>2}: numpy_RMSE={r_np:.4e}  cfn_RMSE={r_cfn:.4e}")
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
     return rmse_rows
+
+
+def plot_rollout_summary(all_rollout_rows: dict, out_path: Path, integrator: str):
+    """Plot CFN and NumPy-ref rollout RMSE vs k, one line per dataset.
+
+    all_rollout_rows: {dataset_name: [(k, r_np, r_cfn), ...]}
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharey=True)
+    cmap = plt.get_cmap("tab10")
+
+    for i, (name, rows) in enumerate(all_rollout_rows.items()):
+        if not rows:
+            continue
+        ks = [r[0] for r in rows]
+        r_np = [r[1] for r in rows]
+        r_cfn = [r[2] for r in rows]
+        color = cmap(i % 10)
+        axes[0].plot(ks, r_cfn, marker="o", color=color, label=name)
+        axes[1].plot(ks, r_np, marker="s", color=color, label=name)
+
+    axes[0].set_yscale("log")
+    axes[0].set_xlabel("snapshot k")
+    axes[0].set_ylabel("RMSE")
+    axes[0].set_title(f"CFN rollout RMSE ({integrator})")
+    axes[0].legend(fontsize="small")
+    axes[0].grid(True, which="both", alpha=0.3)
+
+    axes[1].set_yscale("log")
+    axes[1].set_xlabel("snapshot k")
+    axes[1].set_title(f"NumPy reference rollout RMSE ({integrator})")
+    axes[1].legend(fontsize="small")
+    axes[1].grid(True, which="both", alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def get_rollout_specs(run_cfg: dict):
+    """Return a normalized list of rollout dataset specs."""
+    rollout_specs = run_cfg.get("rollout_datasets", None)
+
+    if rollout_specs:
+        normalized = []
+        for i, spec in enumerate(rollout_specs, start=1):
+            normalized.append({
+                "name": spec.get("name", f"dataset_{i}"),
+                "path": spec["path"],
+                "L": int(spec.get("L", run_cfg.get("L", 160))),
+                "margin": int(spec.get("margin", run_cfg.get("margin", 16))),
+            })
+        return normalized
+
+    # fallback to old single-dataset behavior
+    data_path = run_cfg.get("data", None)
+    if data_path:
+        return [{
+            "name": "default",
+            "path": data_path,
+            "L": int(run_cfg.get("L", 160)),
+            "margin": int(run_cfg.get("margin", 16)),
+        }]
+
+    return []
 
 
 # --- main ----------------------------------------------------------------
@@ -197,7 +269,7 @@ def main():
     else:
         print("No config.yaml in run dir; using CLI/default values.")
 
-    model_init    = load_model(args.run_dir / "model_init.pt",    features, dt, dx, device)
+    model_init = load_model(args.run_dir / "model_init.pt", features, dt, dx, device)
     model_trained = load_model(args.run_dir / "model_trained.pt", features, dt, dx, device)
     history = np.load(args.run_dir / "loss_history.npy")
 
@@ -217,11 +289,11 @@ def main():
                                dtype=torch.float32, device=device).view(1, -1, 1)
     with torch.no_grad():
         flux_before_full = model_init.num_flux(u_centers).cpu().numpy().flatten()
-        flux_after_full  = model_trained.num_flux(u_centers).cpu().numpy().flatten()
+        flux_after_full = model_trained.num_flux(u_centers).cpu().numpy().flatten()
     u_centers_np = u_centers.cpu().numpy().flatten()
 
     u_mid, flux_before = crop_to_interface_midpoints(u_centers_np, flux_before_full, pad)
-    _,     flux_after  = crop_to_interface_midpoints(u_centers_np, flux_after_full,  pad)
+    _, flux_after = crop_to_interface_midpoints(u_centers_np, flux_after_full, pad)
 
     flux_true_raw = flux_function(u_mid)
     flux_true, mid_idx = align_by_midpoint(flux_after, flux_true_raw)
@@ -229,72 +301,35 @@ def main():
     anchor_F = float(flux_after[mid_idx])
     print(f"Alignment anchor: u={anchor_u:.4f}, F_model={anchor_F:.4e}")
 
-    dfdu_true   = central_diff(flux_function, u_mid, eps)
+    dfdu_true = central_diff(flux_function, u_mid, eps)
     dfdu_before = np.gradient(flux_before, u_mid)
-    dfdu_after  = np.gradient(flux_after,  u_mid)
+    dfdu_after = np.gradient(flux_after, u_mid)
 
-    err_flux = float(np.sqrt(np.mean((flux_after - flux_true) ** 2)))
-    err_dfdu = float(np.sqrt(np.mean((dfdu_after - dfdu_true) ** 2)))
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    axes[0].plot(u_mid, flux_before, label="before")
+    axes[0].plot(u_mid, flux_after, label="after")
+    axes[0].plot(u_mid, flux_true, "--", label="analytical (aligned)")
+    axes[0].axvline(anchor_u, color="grey", lw=0.5, alpha=0.5)
+    axes[0].set_title("Flux comparison (cropped, midpoint-aligned)")
+    axes[0].set_xlabel("u")
+    axes[0].legend()
 
-    INTERIOR_LO, INTERIOR_HI = 0.73, 0.84
-    interior_mask = (u_mid >= INTERIOR_LO) & (u_mid <= INTERIOR_HI)
-    u_int          = u_mid[interior_mask]
-    flux_before_i  = flux_before[interior_mask]
-    flux_after_i   = flux_after[interior_mask]
-    flux_true_i    = flux_true[interior_mask]
-    dfdu_before_i  = dfdu_before[interior_mask]
-    dfdu_after_i   = dfdu_after[interior_mask]
-    dfdu_true_i    = dfdu_true[interior_mask]
-
-    err_flux_int = float(np.sqrt(np.mean((flux_after_i - flux_true_i) ** 2)))
-    err_dfdu_int = float(np.sqrt(np.mean((dfdu_after_i - dfdu_true_i) ** 2)))
-
-    print(f"Flux RMSE       (full {u_mid[0]:.3f}-{u_mid[-1]:.3f}): {err_flux:.4e}")
-    print(f"Derivative RMSE (full {u_mid[0]:.3f}-{u_mid[-1]:.3f}): {err_dfdu:.4e}")
-    print(f"Flux RMSE       (interior {INTERIOR_LO}-{INTERIOR_HI}, n={interior_mask.sum()}): {err_flux_int:.4e}")
-    print(f"Derivative RMSE (interior {INTERIOR_LO}-{INTERIOR_HI}, n={interior_mask.sum()}): {err_dfdu_int:.4e}")
-
-    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
-
-    # --- Top row: full evaluated range ---
-    axes[0, 0].plot(u_mid, flux_before, label="before")
-    axes[0, 0].plot(u_mid, flux_after,  label="after")
-    axes[0, 0].plot(u_mid, flux_true, "--", label="analytical (aligned)")
-    axes[0, 0].axvline(anchor_u, color="grey", lw=0.5, alpha=0.5)
-    axes[0, 0].set_title(f"Flux — full range (RMSE={err_flux:.2e})")
-    axes[0, 0].set_xlabel("u")
-    axes[0, 0].legend()
-
-    axes[0, 1].plot(u_mid, dfdu_before, label="df/du before")
-    axes[0, 1].plot(u_mid, dfdu_after,  label="df/du after")
-    axes[0, 1].plot(u_mid, dfdu_true, "--", label="df/du analytical")
-    axes[0, 1].set_title(f"Derivative — full range (RMSE={err_dfdu:.2e})")
-    axes[0, 1].set_xlabel("u")
-    axes[0, 1].legend()
-
-    # --- Bottom row: interior range [0.73, 0.84] ---
-    axes[1, 0].plot(u_int, flux_before_i, label="before")
-    axes[1, 0].plot(u_int, flux_after_i,  label="after")
-    axes[1, 0].plot(u_int, flux_true_i, "--", label="analytical (aligned)")
-    axes[1, 0].set_title(f"Flux — interior [{INTERIOR_LO}, {INTERIOR_HI}] (RMSE={err_flux_int:.2e})")
-    axes[1, 0].set_xlabel("u")
-    axes[1, 0].legend()
-
-    axes[1, 1].plot(u_int, dfdu_before_i, label="df/du before")
-    axes[1, 1].plot(u_int, dfdu_after_i,  label="df/du after")
-    axes[1, 1].plot(u_int, dfdu_true_i, "--", label="df/du analytical")
-    axes[1, 1].set_title(f"Derivative — interior [{INTERIOR_LO}, {INTERIOR_HI}] (RMSE={err_dfdu_int:.2e})")
-    axes[1, 1].set_xlabel("u")
-    axes[1, 1].legend()
-
+    axes[1].plot(u_mid, dfdu_before, label="df/du before")
+    axes[1].plot(u_mid, dfdu_after, label="df/du after")
+    axes[1].plot(u_mid, dfdu_true, "--", label="df/du analytical")
+    axes[1].set_title("Derivative comparison (cropped)")
+    axes[1].set_xlabel("u")
+    axes[1].legend()
     fig.tight_layout()
     fig.savefig(args.run_dir / "flux_comparison.png", dpi=150)
     plt.close(fig)
 
-    metrics_rows = [
-        ("single_full",     100, err_flux,     err_dfdu),
-        ("single_interior", int(interior_mask.sum()), err_flux_int, err_dfdu_int),
-    ]
+    err_flux = float(np.sqrt(np.mean((flux_after - flux_true) ** 2)))
+    err_dfdu = float(np.sqrt(np.mean((dfdu_after - dfdu_true) ** 2)))
+    print(f"Flux RMSE:       {err_flux:.4e}")
+    print(f"Derivative RMSE: {err_dfdu:.4e}")
+
+    metrics_rows = [("single", "global", 100, err_flux, err_dfdu, "flux_rmse/dfdu_rmse")]
 
     # ---- 3. Multi-resolution comparison ----
     res_list = [30, 100, 300]
@@ -308,61 +343,101 @@ def main():
         dfdu_auto = torch.autograd.grad(flux.sum(), u_centers, create_graph=False)[0]
 
         u_centers_np = u_centers.detach().cpu().numpy().flatten()
-        flux_full    = flux.detach().cpu().numpy().flatten()
-        dfdu_full    = dfdu_auto.detach().cpu().numpy().flatten()
+        flux_full = flux.detach().cpu().numpy().flatten()
+        dfdu_full = dfdu_auto.detach().cpu().numpy().flatten()
 
-        # All quantities evaluated at cell centers (length N - 2*pad).
         u_mid_n, flux_np = crop_to_interface_midpoints(u_centers_np, flux_full, pad)
         dfdu_auto_np = dfdu_full[pad:-pad]
 
         flux_true_raw = flux_function(u_mid_n)
         flux_true, _ = align_by_midpoint(flux_np, flux_true_raw)
 
-        dfdu_fd   = np.gradient(flux_np, u_mid_n)
+        dfdu_fd = np.gradient(flux_np, u_mid_n)
         dfdu_true = central_diff(flux_function, u_mid_n, eps)
 
-        axes[i, 0].plot(u_mid_n, flux_np,    label="learned")
+        axes[i, 0].plot(u_mid_n, flux_np, label="learned")
         axes[i, 0].plot(u_mid_n, flux_true, "--", label="analytical")
         axes[i, 0].set_title(f"Flux (N={N})")
         axes[i, 0].set_xlabel("u")
         axes[i, 0].legend()
 
         axes[i, 1].plot(u_mid_n, dfdu_auto_np, label="autograd")
-        axes[i, 1].plot(u_mid_n, dfdu_fd,      label="finite diff")
+        axes[i, 1].plot(u_mid_n, dfdu_fd, label="finite diff")
         axes[i, 1].plot(u_mid_n, dfdu_true, "--", label="analytical")
         axes[i, 1].set_title(f"Derivative (N={N})")
         axes[i, 1].set_xlabel("u")
         axes[i, 1].legend()
 
-        rmse_flux = float(np.sqrt(np.mean((flux_np    - flux_true) ** 2)))
+        rmse_flux = float(np.sqrt(np.mean((flux_np - flux_true) ** 2)))
         rmse_dfdu = float(np.sqrt(np.mean((dfdu_auto_np - dfdu_true) ** 2)))
-        metrics_rows.append(("multires", N, rmse_flux, rmse_dfdu))
+        metrics_rows.append(("multires", "global", N, rmse_flux, rmse_dfdu, "flux_rmse/dfdu_rmse"))
 
     fig.tight_layout()
     fig.savefig(args.run_dir / "flux_multires.png", dpi=150)
     plt.close(fig)
 
-    # ---- 4. Rollout comparison ----
-    rollout_rows = do_rollout_comparison(
-        model_trained, run_cfg, dt=dt, dx=dx,
-        n_snapshots=args.rollout_snapshots, device=device,
-        out_path=args.run_dir / "rollout_comparison.png",
-        integrator=args.integrator,
-        eval_L=args.eval_L,
-    )
+    # ---- 4. Rollout comparison for one or more datasets ----
+    rollout_specs = get_rollout_specs(run_cfg)
+    all_rollout_rows: dict = {}
+
+    if not rollout_specs:
+        print("No rollout datasets found in config; skipping rollout comparison.")
+    else:
+        for j, spec in enumerate(rollout_specs):
+            dataset_name = spec["name"]
+            data_path = spec["path"]
+            L = spec["L"]
+            margin = spec["margin"]
+
+            safe_name = sanitize_filename(dataset_name)
+
+            print(f"\n=== Evaluating rollout dataset: {dataset_name} ===")
+            rollout_plot_path = args.run_dir / f"rollout_comparison_{safe_name}.png"
+
+            rollout_rows = do_rollout_comparison(
+                model_trained,
+                dt=dt,
+                dx=dx,
+                n_snapshots=args.rollout_snapshots,
+                device=device,
+                out_path=rollout_plot_path,
+                data_path=data_path,
+                L=L,
+                margin=margin,
+                integrator=args.integrator,
+            )
+
+            # For backward compatibility: copy the first rollout plot to the old name
+            if j == 0 and rollout_plot_path.exists():
+                shutil.copyfile(rollout_plot_path, args.run_dir / "rollout_comparison.png")
+
+            if rollout_rows:
+                all_rollout_rows[dataset_name] = rollout_rows
+                for k, r_np_, r_cfn in rollout_rows:
+                    metrics_rows.append((
+                        "rollout",
+                        dataset_name,
+                        k,
+                        r_np_,
+                        r_cfn,
+                        f"numpy_rmse/cfn_rmse ({args.integrator})"
+                    ))
+
+        # Rollout RMSE summary plot (works for 1 or many datasets)
+        if all_rollout_rows:
+            summary_path = args.run_dir / "rollout_rmse_summary.png"
+            plot_rollout_summary(all_rollout_rows, summary_path, args.integrator)
+            print(f"\nWrote rollout RMSE summary to {summary_path}")
 
     # ---- 5. Persist metrics ----
     metrics_path = args.run_dir / "metrics.csv"
     with open(metrics_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["section", "N_or_k", "metric_a", "metric_b", "notes"])
-        for section, N, a, b in metrics_rows:
-            writer.writerow([section, N, f"{a:.6e}", f"{b:.6e}", "flux_rmse/dfdu_rmse"])
-        if rollout_rows:
-            for k, r_np_, r_cfn in rollout_rows:
-                writer.writerow(["rollout", k, f"{r_np_:.6e}", f"{r_cfn:.6e}",
-                                 f"numpy_rmse/cfn_rmse ({args.integrator})"])
-    print(f"Wrote metrics to {metrics_path}")
+        writer.writerow(["section", "dataset", "N_or_k", "metric_a", "metric_b", "notes"])
+        for section, dataset, N, a, b, notes in metrics_rows:
+            writer.writerow([section, dataset, N, f"{a:.6e}", f"{b:.6e}", notes])
+
+    print(f"\nWrote metrics to {metrics_path}")
     print(f"Wrote evaluation plots to {args.run_dir}/")
 
 
