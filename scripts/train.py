@@ -1,144 +1,297 @@
-"""Train a CFN on a precomputed trajectory.
+"""Training loop for the Conservative Flux Network (rollout-only, with validation).
 
-Usage
------
-    python scripts/train.py --config configs/default.yaml
-or
-    python scripts/train.py --data path/to/traj.npy --epochs 66 --lr 2e-3 ...
+Changes from the previous version:
+  - Removed the smoothness penalty entirely (rollout MSE is the only loss).
+  - Added held-out window-based validation each epoch.
+  - Scheduler (ReduceLROnPlateau) and early stopping both watch VAL loss
+    instead of training loss; training-loss signal is too noisy under
+    random-window resampling.
+  - Added gradient clipping (norm 1.0 by default) for parity with neural-operator
+    baselines (FNO/CNN) trained with rollout loss.
+  - Best-by-val checkpoint selection (kept from previous version, now driven by val).
+  - Rollout loss is now the MEAN over rollout_steps (was the sum). Magnitudes
+    are now comparable across different rollout horizons. If you are porting
+    hyperparameters from the previous (sum-based) version, divide ``tol`` by
+    roughly ``rollout_steps`` to retain equivalent stopping behaviour.
+
+Validation rationale
+--------------------
+Time-based splits on a non-stationary trajectory are unreliable: the held-out
+future timesteps live in a different region of state space than training,
+conflating overfitting with extrapolation. Window-based splits sample held-out
+windows from the *same* distribution as training, so val loss is a clean
+generalization signal.
 """
 
 from __future__ import annotations
 
-import argparse
-import json
-from pathlib import Path
+import copy
+from typing import Callable
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import yaml
 
-from cfn import CFN, train_CFN
+from cfn.data import build_epoch_dataset
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train a Conservative Flux Network.")
-    p.add_argument("--config", type=Path, default=None, help="YAML config (overridden by CLI flags).")
-    p.add_argument("--data", type=Path, help="Path to .npy trajectory of shape (1, Nt, Nx, 1).")
-    p.add_argument("--out-dir", type=Path, default=Path("runs/run_0"))
+def _resolve_step_fn(model: nn.Module, integrator: str) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Return the model's per-step function for the named integrator."""
+    name = integrator.lower()
+    if name == "euler":
+        return model.euler
+    if name in ("rk3", "tvd_rk3", "tvdrk3"):
+        return model.TVD_RK3
+    raise ValueError(f"Unknown integrator {integrator!r}; expected 'euler' or 'rk3'.")
 
-    # Model / physics
-    p.add_argument("--features", nargs="+", type=int, default=[64, 64, 64, 64, 1])
-    p.add_argument("--dt", type=float, default=100 / 3200)
-    p.add_argument("--dx", type=float, default=0.4)
 
-    # Training
-    p.add_argument("--epochs", type=int, default=66)
-    p.add_argument("--lr", type=float, default=2e-3)
-    p.add_argument("--early-stop-patience", type=int, default=60)
-    p.add_argument("--lr-patience", type=int, default=10)
-    p.add_argument("--tol", type=float, default=1e-9)
-    p.add_argument("--margin", type=int, default=16)
+def _rollout_loss(
+    model: nn.Module,
+    un: torch.Tensor,
+    u_np1: torch.Tensor,
+    loss_fn: Callable,
+    *,
+    k: int,
+    margin: int,
+    rollout_steps: int,
+    integrator: str,
+) -> torch.Tensor:
+    """Compute mean rollout MSE over ``rollout_steps`` future targets.
 
-    # Window sampling
-    p.add_argument("--window-t", type=int, default=700)
-    p.add_argument("--window-x", type=int, default=80)
-    p.add_argument("--num-samples", type=int, default=126)
-    p.add_argument("--L", type=int, default=160)
-    p.add_argument("--rollout-steps", type=int, default=4)
-    p.add_argument("--num-draws", type=int, default=3)
+    For each target, advance the state ``k`` integrator steps then compare
+    interior region (excluding ``margin`` boundary points) against the
+    corresponding snapshot. Returns the per-step MEAN as a tensor (sum
+    divided by ``rollout_steps``) so loss magnitudes stay comparable
+    across different choices of ``rollout_steps``. The caller can choose
+    to backprop or not.
+    """
+    step_fn = _resolve_step_fn(model, integrator)
+    loss = torch.tensor(0.0, device=un.device)
+    um = un
 
-    # Smoothness regularisation
-    p.add_argument("--use-smooth", action="store_true")
-    p.add_argument("--lambda-smooth", type=float, default=1e-4)
+    for target_id in range(rollout_steps):
+        for _ in range(k):
+            um = step_fn(um)
+        pred = um[:, margin:-margin, :]
+        target = u_np1[:, target_id, margin:-margin, :]
+        loss = loss + loss_fn(pred, target)
 
-    p.add_argument(
-        "--integrator",
-        choices=["euler", "rk3"],
-        default="euler",
-        help="Per-step integrator used during training rollouts.",
+    return loss / rollout_steps
+
+
+def apply_model(
+    model: nn.Module,
+    un: torch.Tensor,
+    u_np1: torch.Tensor,
+    loss_fn: Callable,
+    optimizer: torch.optim.Optimizer,
+    *,
+    is_training: bool = True,
+    k: int = 160,
+    margin: int = 20,
+    rollout_steps: int | None = 9,
+    integrator: str = "euler",
+    grad_clip: float | None = 1.0,
+) -> float:
+    """Roll the model out and accumulate rollout MSE against future snapshots.
+
+    If ``is_training`` is True, runs backprop, gradient clip, and optimizer step.
+    If False, no grads are computed.
+
+    Parameters
+    ----------
+    grad_clip : float or None
+        If positive, clip gradient norm to this value before stepping.
+        Ignored when ``is_training`` is False.
+
+    Returns
+    -------
+    loss_value : float
+        The mean rollout loss (per-step) as a Python float. Independent of
+        ``rollout_steps`` magnitude, so loss values are directly comparable
+        across different rollout horizons.
+    """
+    if rollout_steps is None:
+        rollout_steps = int(u_np1.shape[1])
+
+    if is_training:
+        optimizer.zero_grad()
+        loss = _rollout_loss(
+            model, un, u_np1, loss_fn,
+            k=k, margin=margin, rollout_steps=rollout_steps,
+            integrator=integrator,
+        )
+        loss.backward()
+        if grad_clip is not None and grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+        return float(loss.detach().item())
+    else:
+        with torch.no_grad():
+            loss = _rollout_loss(
+                model, un, u_np1, loss_fn,
+                k=k, margin=margin, rollout_steps=rollout_steps,
+                integrator=integrator,
+            )
+        return float(loss.item())
+
+
+def train_epoch(
+    model: nn.Module,
+    full_data: np.ndarray,
+    optimizer: torch.optim.Optimizer,
+    loss_fn: Callable,
+    *,
+    device: torch.device,
+    window_t: int = 16,
+    window_x: int = 80,
+    num_samples: int = 16,
+    num_val_samples: int = 4,
+    L: int = 160,
+    margin: int = 20,
+    rollout_steps: int = 9,
+    num_draws: int = 5,
+    integrator: str = "euler",
+    grad_clip: float | None = 1.0,
+) -> tuple[float, float]:
+    """Run ``num_draws`` random-window draws and return (train_loss, val_loss).
+
+    Each draw samples ``num_samples + num_val_samples`` windows from
+    ``build_epoch_dataset``, then splits them: first ``num_samples`` for
+    training (with backprop + grad clip), last ``num_val_samples`` for
+    held-out evaluation (no grad). Both losses are averaged over draws.
+    """
+    total_train = 0.0
+    total_val = 0.0
+
+    for _ in range(num_draws):
+        data = build_epoch_dataset(
+            full_data,
+            window_t=window_t,
+            window_x=window_x,
+            num_samples=num_samples + num_val_samples,
+            L=L,
+        )
+        un_all = torch.tensor(data["un"], dtype=torch.float32, device=device)
+        u_np1_all = torch.tensor(data["un_p1"], dtype=torch.float32, device=device)
+
+        un_train, un_val = un_all[:num_samples], un_all[num_samples:]
+        u_np1_train, u_np1_val = u_np1_all[:num_samples], u_np1_all[num_samples:]
+
+        # Training step
+        model.train()
+        loss_t = apply_model(
+            model, un_train, u_np1_train, loss_fn, optimizer,
+            is_training=True,
+            k=L, margin=margin, rollout_steps=rollout_steps,
+            integrator=integrator, grad_clip=grad_clip,
+        )
+        total_train += loss_t
+
+        # Validation step
+        model.eval()
+        loss_v = apply_model(
+            model, un_val, u_np1_val, loss_fn, optimizer,
+            is_training=False,
+            k=L, margin=margin, rollout_steps=rollout_steps,
+            integrator=integrator,
+        )
+        total_val += loss_v
+
+    return total_train / num_draws, total_val / num_draws
+
+
+def train_CFN(
+    model: nn.Module,
+    full_data: np.ndarray,
+    loss_fn: Callable,
+    optimizer: torch.optim.Optimizer,
+    *,
+    device: torch.device,
+    max_epochs: int = 200,
+    early_stop_patience: int = 20,
+    lr_patience: int = 5,
+    tol: float = 1e-6,
+    lr_factor: float = 0.5,
+    margin: int = 20,
+    window_t: int = 16,
+    window_x: int = 80,
+    num_samples: int = 16,
+    num_val_samples: int = 4,
+    L: int = 160,
+    rollout_steps: int = 9,
+    num_draws: int = 5,
+    integrator: str = "euler",
+    grad_clip: float | None = 1.0,
+    verbose: bool = True,
+) -> tuple[nn.Module, dict, dict]:
+    """Train CFN with rollout MSE, val-based scheduler + early stopping.
+
+    Each epoch holds out ``num_val_samples`` random windows for validation.
+    ReduceLROnPlateau and early stopping both react to val loss. Best-by-val
+    checkpoint is restored before returning.
+
+    Returns
+    -------
+    model : nn.Module
+        With best-by-val weights loaded.
+    history : dict
+        ``history['train']`` and ``history['val']`` are lists of per-epoch losses.
+    info : dict
+        Summary metadata (best_val, epochs_run, final_lr, early_stopped, integrator).
+    """
+    best_model = copy.deepcopy(model)
+    best_val = float("inf")
+    no_improve = 0
+    history: dict[str, list[float]] = {"train": [], "val": []}
+    early_stopped = False
+    epoch = 0
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=lr_factor, patience=lr_patience, threshold=tol
     )
 
-    p.add_argument("--seed", type=int, default=0)
-    return p.parse_args()
+    for epoch in range(max_epochs):
+        train_loss, val_loss = train_epoch(
+            model, full_data, optimizer, loss_fn,
+            device=device,
+            window_t=window_t, window_x=window_x,
+            num_samples=num_samples, num_val_samples=num_val_samples,
+            L=L, margin=margin,
+            rollout_steps=rollout_steps, num_draws=num_draws,
+            integrator=integrator, grad_clip=grad_clip,
+        )
+        history["train"].append(train_loss)
+        history["val"].append(val_loss)
 
+        # Both scheduler and early-stop watch val loss
+        scheduler.step(val_loss)
 
-def merge_config(args: argparse.Namespace) -> dict:
-    """Load YAML if provided, then overlay any explicit CLI flags."""
-    cfg: dict = {}
-    if args.config is not None:
-        cfg = yaml.safe_load(args.config.read_text()) or {}
+        if verbose:
+            current_lr = optimizer.param_groups[0]["lr"]
+            print(f"epoch={epoch:3d} | train={train_loss:.4e} | "
+                  f"val={val_loss:.4e} | lr={current_lr:.2e}")
 
-    cli = vars(args)
-    cli.pop("config", None)
-    for k, v in cli.items():
-        if v is not None:
-            cfg[k] = v
-    return cfg
+        if val_loss < best_val - tol:
+            best_val = val_loss
+            best_model = copy.deepcopy(model)
+            no_improve = 0
+        else:
+            no_improve += 1
 
+        if no_improve >= early_stop_patience:
+            early_stopped = True
+            if verbose:
+                print(f"Early stopping at epoch {epoch} (best val={best_val:.4e})")
+            break
 
-def main() -> None:
-    args = parse_args()
-    cfg = merge_config(args)
+    model.load_state_dict(best_model.state_dict())
 
-    if "data" not in cfg or cfg["data"] is None:
-        raise SystemExit("Must specify --data or 'data:' in the config file.")
-
-    out_dir = Path(cfg["out_dir"])
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Persist the resolved config so evaluate.py can pick up model/physics
-    # parameters automatically.  Paths are stringified for YAML round-tripping.
-    cfg_to_save = {k: (str(v) if isinstance(v, Path) else v) for k, v in cfg.items()}
-    (out_dir / "config.yaml").write_text(yaml.safe_dump(cfg_to_save, sort_keys=True))
-
-    torch.manual_seed(cfg["seed"])
-    np.random.seed(cfg["seed"])
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # ---- data ----
-    phi_xt = np.load(cfg["data"])
-    print(f"Loaded data shape: {phi_xt.shape}")
-    assert phi_xt.ndim == 4, f"Expected 4D trajectory, got {phi_xt.shape}"
-
-    # ---- model ----
-    model = CFN(features=list(cfg["features"]), dt=cfg["dt"], dx=cfg["dx"]).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=cfg["lr"])
-    loss_fn = nn.MSELoss()
-
-    # Save initial model for later before/after comparisons
-    torch.save(model.state_dict(), out_dir / "model_init.pt")
-
-    trained, history, info = train_CFN(
-        model,
-        phi_xt,
-        loss_fn,
-        optimizer,
-        device=device,
-        max_epochs=cfg["epochs"],
-        early_stop_patience=cfg["early_stop_patience"],
-        lr_patience=cfg["lr_patience"],
-        tol=cfg["tol"],
-        margin=cfg["margin"],
-        window_t=cfg["window_t"],
-        window_x=cfg["window_x"],
-        num_samples=cfg["num_samples"],
-        L=cfg["L"],
-        rollout_steps=cfg["rollout_steps"],
-        num_draws=cfg["num_draws"],
-        use_smooth=cfg["use_smooth"],
-        lambda_smooth=cfg["lambda_smooth"],
-        integrator=cfg.get("integrator", "euler"),
-    )
-
-    torch.save(trained.state_dict(), out_dir / "model_trained.pt")
-    np.save(out_dir / "loss_history.npy", np.asarray(history))
-    (out_dir / "train_summary.json").write_text(json.dumps(info, indent=2))
-    print(f"Saved model + loss history + summary to {out_dir}/")
-
-
-if __name__ == "__main__":
-    main()
+    info = {
+        "epochs_run": epoch + 1 if history["train"] else 0,
+        "best_val": float(best_val) if best_val != float("inf") else None,
+        "final_lr": float(optimizer.param_groups[0]["lr"]),
+        "early_stopped": early_stopped,
+        "integrator": integrator,
+    }
+    return model, history, info
