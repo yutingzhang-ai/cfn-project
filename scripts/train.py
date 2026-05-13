@@ -19,56 +19,93 @@ import torch.nn as nn
 import torch.optim as optim
 import yaml
 
-from cfn import CFN, train_CFN
+from cfn import CFN, train_CFN, theoretical
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train a Conservative Flux Network.")
     p.add_argument("--config", type=Path, default=None, help="YAML config (overridden by CLI flags).")
     p.add_argument("--data", type=Path, help="Path to .npy trajectory of shape (1, Nt, Nx, 1).")
-    p.add_argument("--out-dir", type=Path, default=Path("runs/run_0"))
+    p.add_argument("--out-dir", type=Path, default=None,
+                   help="Output directory. Default: runs/run_0 (or from config).")
 
-    # Model / physics
-    p.add_argument("--features", nargs="+", type=int, default=[64, 64, 64, 64, 1])
-    p.add_argument("--dt", type=float, default=100 / 3200)
-    p.add_argument("--dx", type=float, default=0.4)
-
-    # Training
-    p.add_argument("--epochs", type=int, default=66)
-    p.add_argument("--lr", type=float, default=2e-3)
-    p.add_argument("--early-stop-patience", type=int, default=60)
-    p.add_argument("--lr-patience", type=int, default=10)
-    p.add_argument("--tol", type=float, default=1e-9)
-    p.add_argument("--margin", type=int, default=16)
-
-    # Window sampling
-    p.add_argument("--window-t", type=int, default=700)
-    p.add_argument("--window-x", type=int, default=80)
-    p.add_argument("--num-samples", type=int, default=126)
-    p.add_argument("--L", type=int, default=160)
-    p.add_argument("--rollout-steps", type=int, default=4)
-    p.add_argument("--num-draws", type=int, default=3)
-
-    # Smoothness regularisation
-    p.add_argument("--use-smooth", action="store_true")
-    p.add_argument("--lambda-smooth", type=float, default=1e-4)
-
+    # Equation / boundary
     p.add_argument(
-        "--integrator",
-        choices=["euler", "rk3"],
-        default="euler",
-        help="Per-step integrator used during training rollouts.",
+        "--equation",
+        choices=["whitham", "burgers", "saint_venant"],
+        default=None,
+        help="Which analytical flux to learn against. Default: whitham.",
+    )
+    p.add_argument(
+        "--boundary-mode",
+        choices=["extrapolate", "outflow", "reflect", "periodic"],
+        default=None,
+        help="Padding mode for the flux network. Default: extrapolate (Whitham).",
     )
 
-    p.add_argument("--seed", type=int, default=0)
+    # Model / physics
+    p.add_argument("--features", nargs="+", type=int, default=None)
+    p.add_argument("--dt", type=float, default=None)
+    p.add_argument("--dx", type=float, default=None)
+
+    # Training
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--early-stop-patience", type=int, default=None)
+    p.add_argument("--lr-patience", type=int, default=None)
+    p.add_argument("--tol", type=float, default=None)
+    p.add_argument("--margin", type=int, default=None)
+
+    # Window sampling
+    p.add_argument("--window-t", type=int, default=None)
+    p.add_argument("--window-x", type=int, default=None)
+    p.add_argument("--num-samples", type=int, default=None)
+    p.add_argument("--L", type=int, default=None)
+    p.add_argument("--rollout-steps", type=int, default=None)
+    p.add_argument("--num-draws", type=int, default=None)
+
+    # Smoothness regularisation
+    p.add_argument("--use-smooth", action="store_true", default=None)
+    p.add_argument("--lambda-smooth", type=float, default=None)
+
+    p.add_argument("--integrator", choices=["euler", "rk3"], default=None,
+                   help="Per-step integrator used during training rollouts.")
+    p.add_argument("--seed", type=int, default=None)
     return p.parse_args()
 
 
+# Hard defaults applied only when neither config nor CLI provide a value.
+_DEFAULTS = {
+    "equation": "whitham",
+    "boundary_mode": "extrapolate",
+    "features": [64, 64, 64, 64, 1],
+    "dt": 100 / 3200,
+    "dx": 0.4,
+    "epochs": 66,
+    "lr": 2e-3,
+    "early_stop_patience": 60,
+    "lr_patience": 10,
+    "tol": 1e-9,
+    "margin": 16,
+    "window_t": 700,
+    "window_x": 80,
+    "num_samples": 126,
+    "L": 160,
+    "rollout_steps": 4,
+    "num_draws": 3,
+    "use_smooth": False,
+    "lambda_smooth": 1e-4,
+    "integrator": "euler",
+    "seed": 0,
+    "out_dir": Path("runs/run_0"),
+}
+
+
 def merge_config(args: argparse.Namespace) -> dict:
-    """Load YAML if provided, then overlay any explicit CLI flags."""
-    cfg: dict = {}
+    """Defaults < YAML < CLI."""
+    cfg: dict = dict(_DEFAULTS)
     if args.config is not None:
-        cfg = yaml.safe_load(args.config.read_text()) or {}
+        cfg.update(yaml.safe_load(args.config.read_text()) or {})
 
     cli = vars(args)
     cli.pop("config", None)
@@ -85,11 +122,21 @@ def main() -> None:
     if "data" not in cfg or cfg["data"] is None:
         raise SystemExit("Must specify --data or 'data:' in the config file.")
 
+    # ---- Activate the right analytical flux BEFORE building the model.
+    # solvers.py reads theoretical.flux_function at call time, so this also
+    # affects the numpy reference solver used downstream.
+    eq = theoretical.set_equation(cfg["equation"])
+    print(f"Equation: {eq.name}  (n_components={eq.n_components}, "
+          f"u in [{eq.u_min}, {eq.u_max}])")
+    if eq.n_components > 1:
+        raise SystemExit(
+            f"Equation {eq.name!r} is a system (n_components={eq.n_components}). "
+            "The scalar CFN cannot train on this yet."
+        )
+
     out_dir = Path(cfg["out_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Persist the resolved config so evaluate.py can pick up model/physics
-    # parameters automatically.  Paths are stringified for YAML round-tripping.
     cfg_to_save = {k: (str(v) if isinstance(v, Path) else v) for k, v in cfg.items()}
     (out_dir / "config.yaml").write_text(yaml.safe_dump(cfg_to_save, sort_keys=True))
 
@@ -105,11 +152,15 @@ def main() -> None:
     assert phi_xt.ndim == 4, f"Expected 4D trajectory, got {phi_xt.shape}"
 
     # ---- model ----
-    model = CFN(features=list(cfg["features"]), dt=cfg["dt"], dx=cfg["dx"]).to(device)
+    model = CFN(
+        features=list(cfg["features"]),
+        dt=cfg["dt"],
+        dx=cfg["dx"],
+        boundary_mode=cfg["boundary_mode"],
+    ).to(device)
     optimizer = optim.Adam(model.parameters(), lr=cfg["lr"])
     loss_fn = nn.MSELoss()
 
-    # Save initial model for later before/after comparisons
     torch.save(model.state_dict(), out_dir / "model_init.pt")
 
     trained, history, info = train_CFN(
@@ -129,13 +180,18 @@ def main() -> None:
         L=cfg["L"],
         rollout_steps=cfg["rollout_steps"],
         num_draws=cfg["num_draws"],
-        use_smooth=cfg["use_smooth"],
-        lambda_smooth=cfg["lambda_smooth"],
         integrator=cfg.get("integrator", "euler"),
     )
 
     torch.save(trained.state_dict(), out_dir / "model_trained.pt")
-    np.save(out_dir / "loss_history.npy", np.asarray(history))
+    # history is {"train": [...], "val": [...]} from the current train_CFN.
+    # Save train-loss as the old single-array format for back-compat with
+    # evaluate.py's loss_history.png plot, plus the full dict alongside.
+    if isinstance(history, dict):
+        np.save(out_dir / "loss_history.npy", np.asarray(history["train"]))
+        np.save(out_dir / "loss_history_full.npy", history, allow_pickle=True)
+    else:
+        np.save(out_dir / "loss_history.npy", np.asarray(history))
     (out_dir / "train_summary.json").write_text(json.dumps(info, indent=2))
     print(f"Saved model + loss history + summary to {out_dir}/")
 

@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from cfn.padding import input_nonperiodic_padding
+from cfn.padding import input_circular_padding, input_nonperiodic_padding
 
 
 class ResidualBlock(nn.Module):
@@ -37,11 +37,24 @@ class ResidualBlock(nn.Module):
         return h + x
 
 
+# Boundary modes
+_NONPERIODIC_MODES = {"outflow", "reflect", "extrapolate"}
+_BOUNDARY_MODES = _NONPERIODIC_MODES | {"periodic"}
+
+
 class Flux(nn.Module):
-    """Numerical flux network ``u -> F(u)`` using non-periodic padding.
+    """Numerical flux network ``u -> F(u)``.
 
     Maps ``[batch, Nx, 1]`` inputs to ``[batch, Nx + 1, out_channels]`` flux
     values defined on cell interfaces.
+
+    Parameters
+    ----------
+    boundary_mode : str
+        One of ``"periodic"`` (circular padding) or
+        ``"outflow"`` / ``"reflect"`` / ``"extrapolate"`` (non-periodic ghost
+        cells). The non-periodic modes are forwarded to
+        :func:`cfn.padding.input_nonperiodic_padding`.
     """
 
     def __init__(
@@ -54,6 +67,11 @@ class Flux(nn.Module):
         boundary_mode: str = "extrapolate",
     ):
         super().__init__()
+        if boundary_mode not in _BOUNDARY_MODES:
+            raise ValueError(
+                f"Unknown boundary_mode {boundary_mode!r}; "
+                f"expected one of {sorted(_BOUNDARY_MODES)}"
+            )
         self.features = features
         self.left_padding = left_padding
         self.right_padding = right_padding
@@ -68,10 +86,16 @@ class Flux(nn.Module):
         # Project back to flux channels
         self.output_conv = nn.Conv1d(features[0], features[-1], kernel_size=1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_padded = input_nonperiodic_padding(
+    def _pad(self, x: torch.Tensor) -> torch.Tensor:
+        """Dispatch to the right padding function based on ``boundary_mode``."""
+        if self.boundary_mode == "periodic":
+            return input_circular_padding(x, self.left_padding, self.right_padding)
+        return input_nonperiodic_padding(
             x, self.left_padding, self.right_padding, mode=self.boundary_mode
         )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_padded = self._pad(x)
 
         h = self.input_conv(x_padded)
         # h = F.leaky_relu(h)
@@ -93,6 +117,13 @@ class CFN(nn.Module):
 
     Implements forward Euler and TVD-RK3 time stepping for a 1D conservation
     law ``u_t + F(u)_x = 0``.
+
+    Parameters
+    ----------
+    boundary_mode : str
+        Padding mode for the flux network. ``"extrapolate"`` (default) matches
+        the original non-periodic behaviour; pass ``"periodic"`` for circular
+        boundary conditions (e.g. Burgers on a periodic domain).
     """
 
     DEFAULT_DX = 2 * math.pi / 512
@@ -106,15 +137,22 @@ class CFN(nn.Module):
         limiter: str = "minmod",
         left_padding: int = 2,
         right_padding: int = 3,
+        boundary_mode: str = "extrapolate",
     ):
         super().__init__()
         if features is None:
             features = [64, 64, 64, 64, 64, 1]
-        self.num_flux = Flux(features, left_padding=left_padding, right_padding=right_padding)
+        self.num_flux = Flux(
+            features,
+            left_padding=left_padding,
+            right_padding=right_padding,
+            boundary_mode=boundary_mode,
+        )
         self.dt = dt
         self.dx = dx
         self.boundary = boundary.lower()
         self.limiter = limiter.lower()  # reserved for future use
+        self.boundary_mode = boundary_mode
 
     def flux(self, up: torch.Tensor) -> torch.Tensor:
         return self.num_flux(up)

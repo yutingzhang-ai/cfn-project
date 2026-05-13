@@ -1,0 +1,32 @@
+# Burgers equation on [0, 2pi], IC = sin(2x), periodic BCs.
+# Target flux: F(u) = 1/2 u^2.
+
+equation: burgers
+boundary_mode: periodic
+
+data: data/burgers_traj.npy
+out_dir: runs/run_burgers
+
+features: [64, 64, 64, 64, 1]
+dt: 0.005
+dx: 0.012271846   # 2*pi / 512
+
+epochs: 200
+lr: 5.0e-4         # conservative: avoid NaN at init
+early_stop_patience: 60
+lr_patience: 15
+tol: 1.0e-9
+
+margin: 0          # periodic -> no boundary cells to discard
+
+# Start with L=1 (safest), rollout_steps=4 targets, small windows.
+# Once loss is stable and non-NaN, try L=4 then L=8.
+window_t: 20
+window_x: 128
+num_samples: 32
+L: 1
+rollout_steps: 4
+num_draws: 3
+
+integrator: euler
+seed: 0

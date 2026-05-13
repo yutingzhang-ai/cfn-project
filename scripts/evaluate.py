@@ -1,25 +1,10 @@
-"""Evaluate a trained CFN against the theoretical Whitham flux.
+"""Evaluate a trained CFN against the analytical flux for its equation.
 
 Supports:
-- single default rollout dataset via config["data"]
-- multiple rollout datasets via config["rollout_datasets"]
-
-Each rollout dataset can have:
-    name, path, L, margin
-
-Example config:
-{
-    "data": "runs/run_colab/phi_xt_1.npy",
-    "rollout_datasets": [
-        {"name": "dataset_1", "path": "runs/run_colab/phi_xt_1.npy", "L": 160, "margin": 16},
-        {"name": "dataset_2", "path": "runs/run_colab/phi_xt_2.npy", "L": 160, "margin": 16},
-    ],
-    "features": [64, 64, 64, 64, 1],
-    "dt": 100/3200,
-    "dx": 0.4,
-    "L": 160,
-    "margin": 16,
-}
+- multiple equations (Whitham, Burgers, ...) via cfg["equation"]
+- multiple boundary modes via cfg["boundary_mode"]
+- single default rollout dataset via cfg["data"]
+- multiple rollout datasets via cfg["rollout_datasets"]
 """
 
 from __future__ import annotations
@@ -34,8 +19,7 @@ import numpy as np
 import torch
 import yaml
 
-from cfn import CFN
-from cfn.theoretical import flux_function
+from cfn import CFN, theoretical
 
 
 # --- args / config -------------------------------------------------------
@@ -47,12 +31,21 @@ def parse_args() -> argparse.Namespace:
                    help="Override model widths; defaults to run_dir/config.yaml.")
     p.add_argument("--dt", type=float, default=None)
     p.add_argument("--dx", type=float, default=None)
-    p.add_argument("--u-min", type=float, default=0.66)
-    p.add_argument("--u-max", type=float, default=0.88)
+    p.add_argument("--u-min", type=float, default=None,
+                   help="Lower u sampling bound. Default: from active equation.")
+    p.add_argument("--u-max", type=float, default=None,
+                   help="Upper u sampling bound. Default: from active equation.")
     p.add_argument("--pad", type=int, default=3)
     p.add_argument("--rollout-snapshots", type=int, default=4)
     p.add_argument("--integrator", choices=["euler", "rk3"], default="euler",
                    help="Integrator for rollout comparison (default: euler).")
+    p.add_argument("--equation", choices=["whitham", "burgers", "saint_venant"],
+                   default=None,
+                   help="Override equation; defaults to run_dir/config.yaml.")
+    p.add_argument("--boundary-mode",
+                   choices=["extrapolate", "outflow", "reflect", "periodic"],
+                   default=None,
+                   help="Override boundary mode; defaults to run_dir/config.yaml.")
     return p.parse_args()
 
 
@@ -70,8 +63,23 @@ def resolve_model_params(args, run_cfg):
     return list(features), dt, dx
 
 
-def load_model(state_path, features, dt, dx, device) -> CFN:
-    model = CFN(features=list(features), dt=dt, dx=dx).to(device)
+def resolve_equation_and_boundary(args, run_cfg):
+    """Pick the equation and boundary mode, preferring CLI > config > defaults."""
+    equation = args.equation or run_cfg.get("equation", "whitham")
+    boundary_mode = args.boundary_mode or run_cfg.get("boundary_mode", "extrapolate")
+    return equation, boundary_mode
+
+
+def resolve_u_range(args, equation_obj):
+    """u_min/u_max: CLI overrides, otherwise equation defaults."""
+    u_min = args.u_min if args.u_min is not None else equation_obj.u_min
+    u_max = args.u_max if args.u_max is not None else equation_obj.u_max
+    return float(u_min), float(u_max)
+
+
+def load_model(state_path, features, dt, dx, device, boundary_mode) -> CFN:
+    model = CFN(features=list(features), dt=dt, dx=dx,
+                boundary_mode=boundary_mode).to(device)
     model.load_state_dict(torch.load(state_path, map_location=device))
     model.eval()
     return model
@@ -87,14 +95,7 @@ def sanitize_filename(name: str) -> str:
 def crop_to_interface_midpoints(
     u_full: np.ndarray, flux_full: np.ndarray, pad: int
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return (u, flux) of equal length, with flux averaged from surrounding interfaces.
-
-    u_full has Nx cell centers; flux_full has Nx + 1 interfaces.
-    For each kept cell i in [pad, Nx - pad), the cell-centered flux is the
-    average of its two bracketing interfaces flux_full[i] and flux_full[i+1].
-    Both returned arrays have length Nx - 2*pad and share the same u-grid,
-    so midpoint-difference alignment is exact.
-    """
+    """Return (u, flux) of equal length, with flux averaged from surrounding interfaces."""
     u_at_centers = u_full[pad:-pad]
     flux_at_centers = 0.5 * (flux_full[pad:-pad - 1] + flux_full[pad + 1:-pad])
     return u_at_centers, flux_at_centers
@@ -115,15 +116,20 @@ def central_diff(f, u, eps=1e-4):
 # --- rollout -------------------------------------------------------------
 
 def do_rollout_comparison(model, dt, dx, n_snapshots, device, out_path,
-                          data_path, L, margin, integrator="euler"):
+                          data_path, L, margin, boundary_mode="extrapolate",
+                          integrator="euler"):
+    """Roll out the trained model vs the numpy-reference solver vs the data."""
     from cfn.solvers import euler_numpy, tvd_rk3_numpy
 
     if integrator == "euler":
-        np_step, cfn_step = euler_numpy, model.euler
+        np_step_fn, cfn_step = euler_numpy, model.euler
     elif integrator == "rk3":
-        np_step, cfn_step = tvd_rk3_numpy, model.TVD_RK3
+        np_step_fn, cfn_step = tvd_rk3_numpy, model.TVD_RK3
     else:
         raise ValueError(f"Unknown integrator {integrator!r}")
+
+    def np_step(u, dt, dx):
+        return np_step_fn(u, dt, dx, boundary_mode=boundary_mode)
 
     if n_snapshots <= 0:
         print("Skipping rollout comparison (--rollout-snapshots <= 0).")
@@ -156,7 +162,7 @@ def do_rollout_comparison(model, dt, dx, n_snapshots, device, out_path,
     x = np.arange(Nx)
     interior = slice(margin, Nx - margin) if margin > 0 else slice(None)
 
-    print(f"Rollout comparison using integrator={integrator!r} on {data_path}")
+    print(f"Rollout comparison: integrator={integrator!r}, boundary={boundary_mode!r}, data={data_path}")
     for k in range(1, n_snapshots + 1):
         for _ in range(L):
             u_np = np_step(u_np, dt, dx)
@@ -167,7 +173,7 @@ def do_rollout_comparison(model, dt, dx, n_snapshots, device, out_path,
         u_data = traj[0, k * L, :, 0]
 
         ax = axes[k - 1, 0]
-        ax.plot(x, u_data, "k-",  lw=1.2, label="data")
+        ax.plot(x, u_data, "k-", lw=1.2, label="data")
         ax.plot(x, u_np[0], "b--", lw=1.0, label=f"numpy ref ({integrator})")
         ax.plot(x, u_cfn_np, "r:", lw=1.2, label=f"CFN ({integrator})")
         if margin > 0:
@@ -190,10 +196,7 @@ def do_rollout_comparison(model, dt, dx, n_snapshots, device, out_path,
 
 
 def plot_rollout_summary(all_rollout_rows: dict, out_path: Path, integrator: str):
-    """Plot CFN and NumPy-ref rollout RMSE vs k, one line per dataset.
-
-    all_rollout_rows: {dataset_name: [(k, r_np, r_cfn), ...]}
-    """
+    """Plot CFN and NumPy-ref rollout RMSE vs k, one line per dataset."""
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), sharey=True)
     cmap = plt.get_cmap("tab10")
 
@@ -240,7 +243,6 @@ def get_rollout_specs(run_cfg: dict):
             })
         return normalized
 
-    # fallback to old single-dataset behavior
     data_path = run_cfg.get("data", None)
     if data_path:
         return [{
@@ -263,14 +265,36 @@ def main():
 
     run_cfg = load_run_config(args.run_dir)
     features, dt, dx = resolve_model_params(args, run_cfg)
+    equation, boundary_mode = resolve_equation_and_boundary(args, run_cfg)
+
+    # Activate the analytical flux BEFORE anything else touches flux_function
+    # or the solvers. theoretical.flux_function is what gets used everywhere.
+    eq = theoretical.set_equation(equation)
+    u_min, u_max = resolve_u_range(args, eq)
+
+    if eq.n_components > 1:
+        raise SystemExit(
+            f"Equation {eq.name!r} is a system (n_components={eq.n_components}). "
+            "Scalar evaluate.py cannot handle it yet."
+        )
+
     if run_cfg:
-        print(f"Using config from {args.run_dir / 'config.yaml'} "
-              f"(features={features}, dt={dt}, dx={dx}).")
+        print(f"Using config from {args.run_dir / 'config.yaml'}")
     else:
         print("No config.yaml in run dir; using CLI/default values.")
+    print(f"  equation       = {eq.name}")
+    print(f"  boundary_mode  = {boundary_mode}")
+    print(f"  features       = {features}")
+    print(f"  dt             = {dt}")
+    print(f"  dx             = {dx}")
+    print(f"  u range        = [{u_min}, {u_max}]")
 
-    model_init = load_model(args.run_dir / "model_init.pt", features, dt, dx, device)
-    model_trained = load_model(args.run_dir / "model_trained.pt", features, dt, dx, device)
+    flux_function = theoretical.flux_function  # local alias for brevity
+
+    model_init = load_model(args.run_dir / "model_init.pt",
+                            features, dt, dx, device, boundary_mode)
+    model_trained = load_model(args.run_dir / "model_trained.pt",
+                               features, dt, dx, device, boundary_mode)
     history = np.load(args.run_dir / "loss_history.npy")
 
     # ---- 1. Loss curve ----
@@ -285,7 +309,7 @@ def main():
     plt.close()
 
     # ---- 2. Single-resolution flux comparison ----
-    u_centers = torch.linspace(args.u_min, args.u_max, 100,
+    u_centers = torch.linspace(u_min, u_max, 100,
                                dtype=torch.float32, device=device).view(1, -1, 1)
     with torch.no_grad():
         flux_before_full = model_init.num_flux(u_centers).cpu().numpy().flatten()
@@ -310,7 +334,7 @@ def main():
     axes[0].plot(u_mid, flux_after, label="after")
     axes[0].plot(u_mid, flux_true, "--", label="analytical (aligned)")
     axes[0].axvline(anchor_u, color="grey", lw=0.5, alpha=0.5)
-    axes[0].set_title("Flux comparison (cropped, midpoint-aligned)")
+    axes[0].set_title(f"Flux comparison ({eq.name}, cropped, midpoint-aligned)")
     axes[0].set_xlabel("u")
     axes[0].legend()
 
@@ -336,7 +360,7 @@ def main():
     fig, axes = plt.subplots(len(res_list), 2, figsize=(10, 4 * len(res_list)))
 
     for i, N in enumerate(res_list):
-        u_centers = torch.linspace(args.u_min, args.u_max, N,
+        u_centers = torch.linspace(u_min, u_max, N,
                                    dtype=torch.float32, device=device).view(1, -1, 1)
         u_centers.requires_grad_(True)
         flux = model_trained.num_flux(u_centers)
@@ -404,10 +428,10 @@ def main():
                 data_path=data_path,
                 L=L,
                 margin=margin,
+                boundary_mode=boundary_mode,
                 integrator=args.integrator,
             )
 
-            # For backward compatibility: copy the first rollout plot to the old name
             if j == 0 and rollout_plot_path.exists():
                 shutil.copyfile(rollout_plot_path, args.run_dir / "rollout_comparison.png")
 
@@ -423,7 +447,6 @@ def main():
                         f"numpy_rmse/cfn_rmse ({args.integrator})"
                     ))
 
-        # Rollout RMSE summary plot (works for 1 or many datasets)
         if all_rollout_rows:
             summary_path = args.run_dir / "rollout_rmse_summary.png"
             plot_rollout_summary(all_rollout_rows, summary_path, args.integrator)
