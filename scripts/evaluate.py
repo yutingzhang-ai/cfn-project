@@ -295,7 +295,14 @@ def main():
                             features, dt, dx, device, boundary_mode)
     model_trained = load_model(args.run_dir / "model_trained.pt",
                                features, dt, dx, device, boundary_mode)
-    history = np.load(args.run_dir / "loss_history.npy")
+    # loss_history.npy may be a plain 1-D array (list format) or a
+    # 0-d object array wrapping a dict ({"train":[], "val":[]}).
+    _hist_raw = np.load(args.run_dir / "loss_history.npy", allow_pickle=True)
+    if _hist_raw.ndim == 0:
+        _h = _hist_raw.item()
+        history = np.asarray(_h["train"] if isinstance(_h, dict) else _h)
+    else:
+        history = np.asarray(_hist_raw)
 
     # ---- 1. Loss curve ----
     plt.figure()
