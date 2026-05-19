@@ -32,7 +32,8 @@ class ResidualBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.conv1(x)
         # h = F.leaky_relu(h, negative_slope=self.negative_slope)
-        h = torch.tanh(h)
+        # h = torch.tanh(h)
+        h = F.silu(h)
         h = self.conv2(h)
         return h + x
 
@@ -99,7 +100,8 @@ class Flux(nn.Module):
 
         h = self.input_conv(x_padded)
         # h = F.leaky_relu(h)
-        h = torch.tanh(h)
+        # h = torch.tanh(h)
+        h = F.silu(h)
         h = self.blocks(h)
         out = self.output_conv(h)
 
