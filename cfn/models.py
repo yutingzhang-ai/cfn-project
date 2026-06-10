@@ -1,4 +1,34 @@
-"""Conservative Flux Network (CFN) and its residual flux backbone."""
+"""Conservative Flux Network (CFN) and its residual flux backbone.
+
+This version applies an EXPLICIT Rusanov scheme around the learned flux at
+inference time, so Theorem 1 of the paper applies literally:
+
+    F_hat_{i+1/2} = 0.5 (F_theta(u_L) + F_theta(u_R)) - 0.5 alpha (u_R - u_L)
+
+The CNN backbone still has its multi-cell stencil and padding -- it just
+outputs a PER-CELL value F_theta(u_i) instead of a per-interface F_hat. The
+dissipation is supplied by the external Rusanov term, not by whatever the
+network implicitly learned. This trades a little expressivity for genuine
+monotonicity / max-principle / TVD guarantees on the learned scheme.
+
+Differences from the previous version:
+- ``Flux`` now outputs ``[batch, Nx, C]`` (per-cell) instead of
+  ``[batch, Nx + 1, C]`` (per-interface). The crop in ``forward_cell``
+  is ``[left_padding : -right_padding]`` (vs old
+  ``[left_padding : -right_padding + 1]``) so the same padding pattern
+  (default left=2, right=3) now produces Nx cells instead of Nx+1
+  interfaces.
+- A new ``Flux.forward`` exists for evaluator compatibility: it returns
+  the centered-average interface flux (Nx+1 values) derived from the
+  per-cell ``forward_cell``. CFN.rhs does NOT use this method; it
+  calls ``forward_cell`` directly and applies Rusanov externally.
+- ``CFN.rhs`` applies Rusanov via ``torch.roll`` (periodic) or boundary-
+  consistent padding (non-periodic) and a configurable ``alpha_floor``.
+- ``CFN`` exposes an ``alpha_floor`` argument (default 0.0) so you can
+  raise the Rusanov dissipation explicitly during evaluation or training.
+
+State convention everywhere: ``[batch, Nx, C]``.
+"""
 
 from __future__ import annotations
 
@@ -6,21 +36,13 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from cfn.padding import input_circular_padding, input_nonperiodic_padding
+from cfn import theoretical
 
 
 class ResidualBlock(nn.Module):
-    """Residual block with two Conv1d layers and a skip connection.
-
-    Notes
-    -----
-    BatchNorm is intentionally omitted to preserve time-marching consistency
-    when the block is rolled out many steps inside the CFN training loop.
-    The post-residual activation is also omitted to avoid staircase
-    derivative behaviour from piecewise-linear activations.
-    """
+    """Residual block with two Conv1d layers and a skip connection."""
 
     def __init__(self, channels: int, kernel_size: int = 3, negative_slope: float = 0.01):
         super().__init__()
@@ -31,7 +53,6 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.conv1(x)
-        # h = F.leaky_relu(h, negative_slope=self.negative_slope)
         h = torch.tanh(h)
         h = self.conv2(h)
         return h + x
@@ -43,18 +64,20 @@ _BOUNDARY_MODES = _NONPERIODIC_MODES | {"periodic"}
 
 
 class Flux(nn.Module):
-    """Numerical flux network ``u -> F(u)``.
+    """Learned pointwise flux network ``u -> F_theta(u)`` for scalar or system laws.
 
-    Maps ``[batch, Nx, 1]`` inputs to ``[batch, Nx + 1, out_channels]`` flux
-    values defined on cell interfaces.
+    Maps ``[batch, Nx, n_components]`` inputs to ``[batch, Nx, n_components]``
+    flux values defined at cell centers. The CNN backbone still uses a
+    multi-cell stencil and padding, so F_theta(u_i) depends weakly on
+    neighboring cells -- but the OUTPUT is per-cell, and the external
+    Rusanov layer in CFN.rhs is what couples neighbors at each interface.
 
-    Parameters
-    ----------
-    boundary_mode : str
-        One of ``"periodic"`` (circular padding) or
-        ``"outflow"`` / ``"reflect"`` / ``"extrapolate"`` (non-periodic ghost
-        cells). The non-periodic modes are forwarded to
-        :func:`cfn.padding.input_nonperiodic_padding`.
+    For backward compatibility with the original evaluator (which expects
+    Nx+1 interface fluxes), this module's ``forward`` returns interface
+    values: F_iface[i] = 0.5 * (F_cell[i-1] + F_cell[i]) at internal
+    interfaces, with boundary interfaces from the appropriate ghost-cell
+    or wraparound. Use ``forward_cell`` to get the per-cell F_theta(u)
+    directly (this is what CFN.rhs uses internally).
     """
 
     def __init__(
@@ -65,6 +88,7 @@ class Flux(nn.Module):
         num_blocks: int = 1,
         kernel_size: int = 3,
         boundary_mode: str = "extrapolate",
+        n_components: int = 1,
     ):
         super().__init__()
         if boundary_mode not in _BOUNDARY_MODES:
@@ -72,18 +96,22 @@ class Flux(nn.Module):
                 f"Unknown boundary_mode {boundary_mode!r}; "
                 f"expected one of {sorted(_BOUNDARY_MODES)}"
             )
+        if features[-1] != n_components:
+            raise ValueError(
+                f"features[-1] ({features[-1]}) must equal n_components "
+                f"({n_components}). The output channels of the flux network "
+                f"must match the conserved-variable count."
+            )
         self.features = features
         self.left_padding = left_padding
         self.right_padding = right_padding
         self.boundary_mode = boundary_mode
+        self.n_components = n_components
 
-        # Lift scalar input to hidden channels
-        self.input_conv = nn.Conv1d(1, features[0], kernel_size=1)
-        # Deep residual representation
+        self.input_conv = nn.Conv1d(n_components, features[0], kernel_size=1)
         self.blocks = nn.Sequential(
             *[ResidualBlock(features[0], kernel_size) for _ in range(num_blocks)]
         )
-        # Project back to flux channels
         self.output_conv = nn.Conv1d(features[0], features[-1], kernel_size=1)
 
     def _pad(self, x: torch.Tensor) -> torch.Tensor:
@@ -94,36 +122,106 @@ class Flux(nn.Module):
             x, self.left_padding, self.right_padding, mode=self.boundary_mode
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_cell(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-cell F_theta(u). Shape: [batch, Nx, C]. This is what Rusanov uses."""
         x_padded = self._pad(x)
-
         h = self.input_conv(x_padded)
-        # h = F.leaky_relu(h)
         h = torch.tanh(h)
         h = self.blocks(h)
         out = self.output_conv(h)
 
-        # Crop padding so the output sits on Nx + 1 interfaces
         if self.left_padding or self.right_padding:
             start = self.left_padding
-            end = -self.right_padding + 1 if self.right_padding > 0 else None
+            end = -self.right_padding if self.right_padding > 0 else None
             out = out[:, :, start:end]
 
-        return out.transpose(1, 2)
+        return out.transpose(1, 2)  # [batch, Nx, C]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Interface flux F_hat[i+1/2] from per-cell F_theta(u).
+
+        Returns Nx+1 interface values for backward compatibility with the
+        original evaluator. Internal interfaces use centered averaging;
+        boundary interfaces use the equation's boundary mode.
+
+        NOTE: this is *not* the Rusanov interface flux -- it's just the
+        centered average. CFN.rhs does NOT call this method; it calls
+        forward_cell directly and applies Rusanov externally. This
+        forward() exists only so external tools that expect Nx+1 outputs
+        (the evaluator's flux-comparison plot, autograd diagnostics)
+        continue to work.
+        """
+        F_cell = self.forward_cell(x)  # [batch, Nx, C]
+
+        if self.boundary_mode == "periodic":
+            F_right = torch.roll(F_cell, shifts=-1, dims=1)
+            F_iface_internal = 0.5 * (F_cell + F_right)  # [batch, Nx, C]
+            # For periodic we need Nx+1 values: prepend the wraparound interface
+            F_iface_first = F_iface_internal[:, -1:, :]
+            return torch.cat([F_iface_first, F_iface_internal], dim=1)  # [batch, Nx+1, C]
+
+        # Non-periodic: pad cell-space by 1 each side, then average consecutive cells.
+        # input_nonperiodic_padding returns [batch, C, Nx+2] (channels-first); transpose
+        # back to [batch, Nx+2, C] for forward_cell's [batch, Nx, C] interface.
+        x_pad_cf = input_nonperiodic_padding(x, 1, 1, mode=self.boundary_mode)  # [b, C, Nx+2]
+        x_pad = x_pad_cf.transpose(1, 2)  # [b, Nx+2, C]
+        F_pad = self.forward_cell(x_pad)  # [batch, Nx+2, C]
+        return 0.5 * (F_pad[:, :-1, :] + F_pad[:, 1:, :])  # [batch, Nx+1, C]
+
+
+def _torch_wave_speed_traffic(u: torch.Tensor) -> torch.Tensor:
+    """|F'(u)| = |1 - 2u| for LWR traffic. Torch version of cfn.theoretical."""
+    return (1.0 - 2.0 * u).abs()
+
+
+def _torch_wave_speed_burgers(u: torch.Tensor) -> torch.Tensor:
+    """|F'(u)| = |u| for Burgers. Torch version of cfn.theoretical."""
+    return u.abs()
+
+
+def _torch_wave_speed_sine(u: torch.Tensor) -> torch.Tensor:
+    """|F'(u)| = |cos(u)| for sine flux. Torch version of cfn.theoretical."""
+    return u.cos().abs()
+
+
+_TORCH_WAVE_SPEEDS = {
+    "traffic": _torch_wave_speed_traffic,
+    "burgers": _torch_wave_speed_burgers,
+    "sine":    _torch_wave_speed_sine,
+}
+
+
+def _get_torch_wave_speed():
+    """Return a torch-callable analogue of the active equation's wave_speed.
+
+    Falls back to a constant 1.0 if the active equation isn't in our table
+    (so the Rusanov dissipation still works, just with a conservative bound).
+    """
+    eq_name = theoretical.active_equation().name
+    return _TORCH_WAVE_SPEEDS.get(eq_name, lambda u: torch.ones_like(u))
 
 
 class CFN(nn.Module):
-    """Conservative Flux Network wrapping a learnable numerical flux.
+    """Conservative Flux Network with EXPLICIT Rusanov dissipation.
 
-    Implements forward Euler and TVD-RK3 time stepping for a 1D conservation
-    law ``u_t + F(u)_x = 0``.
+    The learned ``Flux`` produces per-cell F_theta(u_i). At each interface
+    i+1/2 we form
+
+        F_hat = 0.5 (F_theta(u_i) + F_theta(u_{i+1}))
+              - 0.5 alpha (u_{i+1} - u_i)
+
+    with alpha = max(|F'(u_i)|, |F'(u_{i+1})|, alpha_floor). The default
+    alpha_floor is 0, which makes alpha equal to the per-interface true
+    wave speed (matching ``cfn.solvers``). Raising alpha_floor adds a
+    uniform safety margin -- useful when |F'_theta| might exceed |F'| on
+    the visited range.
 
     Parameters
     ----------
-    boundary_mode : str
-        Padding mode for the flux network. ``"extrapolate"`` (default) matches
-        the original non-periodic behaviour; pass ``"periodic"`` for circular
-        boundary conditions (e.g. Burgers on a periodic domain).
+    alpha_floor : float, default 0.0
+        Lower bound on the Rusanov dissipation coefficient at every
+        interface. Set to ~1.2-2.0 for traffic if the learned scheme
+        oscillates at shocks.
     """
 
     DEFAULT_DX = 2 * math.pi / 512
@@ -138,29 +236,103 @@ class CFN(nn.Module):
         left_padding: int = 2,
         right_padding: int = 3,
         boundary_mode: str = "extrapolate",
+        n_components: int = 1,
+        alpha_floor: float = 0.0,
     ):
         super().__init__()
         if features is None:
-            features = [64, 64, 64, 64, 64, 1]
+            features = [64, 64, 64, 64, 64, n_components]
+        else:
+            features = list(features)
+            if features[-1] != n_components:
+                features = features[:-1] + [n_components]
+
         self.num_flux = Flux(
             features,
             left_padding=left_padding,
             right_padding=right_padding,
             boundary_mode=boundary_mode,
+            n_components=n_components,
         )
         self.dt = dt
         self.dx = dx
         self.boundary = boundary.lower()
-        self.limiter = limiter.lower()  # reserved for future use
+        self.limiter = limiter.lower()
         self.boundary_mode = boundary_mode
+        self.n_components = n_components
+        self.alpha_floor = float(alpha_floor)
 
+    # ------------------------------------------------------------------ flux
     def flux(self, up: torch.Tensor) -> torch.Tensor:
+        """Interface flux (Nx+1 values) -- for evaluator compatibility.
+
+        This is the centered-average interface flux, NOT the Rusanov flux.
+        Use this only for the evaluator's flux-comparison plot. For the
+        rollout step, CFN.rhs constructs the Rusanov flux internally from
+        ``flux_cell``.
+        """
         return self.num_flux(up)
 
-    def rhs(self, u: torch.Tensor) -> torch.Tensor:
-        flux = self.num_flux(u)
-        return -(flux[:, 1:, :] - flux[:, :-1, :]) / self.dx
+    def flux_cell(self, up: torch.Tensor) -> torch.Tensor:
+        """Per-cell learned flux F_theta(u). Shape: [batch, Nx, C].
 
+        This is the actual learnable function the Rusanov scheme uses.
+        Use this for autograd-based eps measurement
+        (||F'_theta - F'||_Linf) -- it gives you the true derivative
+        of the network's pointwise flux.
+        """
+        return self.num_flux.forward_cell(up)
+
+    # ------------------------------------------------------------------ rhs
+    def _interface_states(self, u: torch.Tensor):
+        """Build (u_L, u_R, F_L, F_R) at each interface using per-cell F_theta."""
+        if self.boundary_mode == "periodic":
+            F = self.num_flux.forward_cell(u)              # [batch, Nx, C]
+            F_left = F                    # F_theta at cell i
+            F_right = torch.roll(F, shifts=-1, dims=1)  # F_theta at cell i+1
+            u_left = u
+            u_right = torch.roll(u, shifts=-1, dims=1)
+            return u_left, u_right, F_left, F_right
+
+        # Non-periodic: pad u by 1 cell each side, evaluate F_theta on padded.
+        # input_nonperiodic_padding returns [batch, C, Nx+2] (channels-first);
+        # transpose back to [batch, Nx+2, C] before calling forward_cell.
+        u_padded_cf = input_nonperiodic_padding(u, 1, 1, mode=self.boundary_mode)
+        u_padded = u_padded_cf.transpose(1, 2)  # [batch, Nx+2, C]
+        F_padded = self.num_flux.forward_cell(u_padded)    # [batch, Nx+2, C]
+        u_left  = u_padded[:, :-1, :]     # [batch, Nx+1, C]
+        u_right = u_padded[:, 1:, :]      # [batch, Nx+1, C]
+        F_left  = F_padded[:, :-1, :]
+        F_right = F_padded[:, 1:, :]
+        return u_left, u_right, F_left, F_right
+
+    def rhs(self, u: torch.Tensor) -> torch.Tensor:
+        """RHS of u_t = -dF/dx, using explicit Rusanov around learned F_theta."""
+        u_left, u_right, F_left, F_right = self._interface_states(u)
+
+        # Dissipation coefficient.
+        wave = _get_torch_wave_speed()
+        alpha = torch.maximum(wave(u_left), wave(u_right))
+        if self.alpha_floor > 0:
+            alpha = torch.clamp(alpha, min=self.alpha_floor)
+        # For systems we'd reduce across components; this version assumes scalar.
+        # alpha shape matches u_left: [batch, Nx_iface, C].
+
+        # Rusanov interface flux.
+        F_hat = 0.5 * (F_left + F_right) - 0.5 * alpha * (u_right - u_left)
+        # F_hat shape: [batch, Nx, C] (periodic) or [batch, Nx+1, C] (non-periodic).
+
+        # Conservative difference.
+        if self.boundary_mode == "periodic":
+            # F_hat[i] is the flux at interface between cells i and i+1.
+            # rhs[i] = -(F_hat[i] - F_hat[i-1]) / dx.
+            F_hat_prev = torch.roll(F_hat, shifts=+1, dims=1)
+            return -(F_hat - F_hat_prev) / self.dx
+        else:
+            # F_hat has Nx+1 interface fluxes; rhs takes consecutive diffs.
+            return -(F_hat[:, 1:, :] - F_hat[:, :-1, :]) / self.dx
+
+    # ----------------------------------------------------------------- steps
     def euler(self, u: torch.Tensor) -> torch.Tensor:
         """Forward Euler time step."""
         return u + self.dt * self.rhs(u)

@@ -2,12 +2,73 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
+import pytest
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
 from cfn import CFN, apply_model
+from cfn.sampling import build_epoch_dataset
+from cfn.training import _make_fixed_validation_set, train_epoch
+
+TRAJ_PATH = Path(__file__).resolve().parents[1] / "data" / "one_traj_loss_check.npy"
+
+
+@pytest.mark.skipif(not TRAJ_PATH.exists(), reason=f"missing trajectory: {TRAJ_PATH}")
+def test_train_epoch_on_one_traj_loss_check():
+    """Mini end-to-end smoke test on the bundled Whitham trajectory."""
+    torch.manual_seed(0)
+    traj = np.load(TRAJ_PATH)
+    assert traj.shape == (1, 3201, 500, 1)
+
+    rng = np.random.default_rng(0)
+    data = build_epoch_dataset(
+        traj,
+        L=160,
+        window_t=700,
+        window_x=80,
+        num_samples=8,
+        rng=rng,
+        per_corner_fraction=0.05,
+    )
+    assert data["un"].shape == (8, 80, 1)
+    assert data["un_p1"].shape == (8, 4, 80, 1)
+
+    device = torch.device("cpu")
+    model = CFN(features=[8, 8, 1], dt=0.03125, dx=0.4).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    loss_fn = nn.MSELoss()
+    val = _make_fixed_validation_set(
+        traj,
+        device=device,
+        window_t=700,
+        window_x=80,
+        num_val_samples=8,
+        L=160,
+        val_per_corner_fraction=0.1,
+    )
+
+    train_loss, val_loss = train_epoch(
+        model,
+        traj,
+        optimizer,
+        loss_fn,
+        device=device,
+        fixed_val_data=val,
+        window_t=700,
+        window_x=80,
+        num_samples=8,
+        L=160,
+        margin=16,
+        rollout_steps=4,
+        num_draws=1,
+        train_per_corner_fraction=0.05,
+    )
+    assert np.isfinite(train_loss)
+    assert np.isfinite(val_loss)
 
 
 def test_constant_input_produces_near_zero_rhs():

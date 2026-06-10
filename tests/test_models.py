@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from cfn import CFN
-from cfn.data import build_epoch_dataset
+from cfn.sampling import build_epoch_dataset
 
 
 def test_cfn_forward_shapes():

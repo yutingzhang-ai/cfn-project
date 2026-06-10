@@ -2,6 +2,9 @@
 
 These functions add ghost cells to a 1D field so that convolutions on the
 interior produce flux values at the right number of cell interfaces.
+
+The state convention is ``[batch, Nx, C]`` where ``C >= 1`` is the number of
+components (channels). Scalar laws are the ``C = 1`` special case.
 """
 
 from __future__ import annotations
@@ -11,13 +14,12 @@ import torch.nn.functional as F
 
 
 def input_circular_padding(x: torch.Tensor, left: int, right: int) -> torch.Tensor:
-    """Periodic (circular) padding for tensors of shape ``[batch, Nx, 1]``.
+    """Periodic (circular) padding for tensors of shape ``[batch, Nx, C]``.
 
-    Returns a tensor of shape ``[batch, 1, Nx + left + right]`` ready for Conv1d.
+    Returns a tensor of shape ``[batch, C, Nx + left + right]`` ready for Conv1d.
     """
-    x_d2 = torch.squeeze(x, 2)
-    x_d2 = torch.unsqueeze(x_d2, 1)
-    return F.pad(x_d2, (left, right), mode="circular")
+    x_bcn = x.transpose(1, 2)  # [batch, C, Nx]
+    return F.pad(x_bcn, (left, right), mode="circular")
 
 
 def input_nonperiodic_padding(
@@ -26,12 +28,12 @@ def input_nonperiodic_padding(
     right: int,
     mode: str = "outflow",
 ) -> torch.Tensor:
-    """Non-periodic ghost-cell padding for tensors of shape ``[batch, Nx, 1]``.
+    """Non-periodic ghost-cell padding for tensors of shape ``[batch, Nx, C]``.
 
     Parameters
     ----------
     x : torch.Tensor
-        Input field, shape ``[batch, Nx, 1]``.
+        Input field, shape ``[batch, Nx, C]``.
     left, right : int
         Number of ghost cells to add on each side.
     mode : {"outflow", "reflect", "extrapolate"}
@@ -42,25 +44,24 @@ def input_nonperiodic_padding(
     Returns
     -------
     torch.Tensor
-        Padded tensor of shape ``[batch, 1, Nx + left + right]``.
+        Padded tensor of shape ``[batch, C, Nx + left + right]``.
     """
-    x_d2 = torch.squeeze(x, 2)       # [batch, Nx]
-    x_d2 = torch.unsqueeze(x_d2, 1)  # [batch, 1, Nx]
+    x_bcn = x.transpose(1, 2)  # [batch, C, Nx]
 
     if mode == "outflow":
-        left_vals = x_d2[:, :, :1].repeat(1, 1, left) if left > 0 else None
-        right_vals = x_d2[:, :, -1:].repeat(1, 1, right) if right > 0 else None
+        left_vals = x_bcn[:, :, :1].repeat(1, 1, left) if left > 0 else None
+        right_vals = x_bcn[:, :, -1:].repeat(1, 1, right) if right > 0 else None
 
     elif mode == "reflect":
-        left_vals = x_d2[:, :, 1:left + 1].flip(-1) if left > 0 else None
-        right_vals = x_d2[:, :, -(right + 1):-1].flip(-1) if right > 0 else None
+        left_vals = x_bcn[:, :, 1:left + 1].flip(-1) if left > 0 else None
+        right_vals = x_bcn[:, :, -(right + 1):-1].flip(-1) if right > 0 else None
 
     elif mode == "extrapolate":
         left_vals = _linear_extrapolate(
-            base=x_d2[:, :, :1], neighbor=x_d2[:, :, 1:2], n=left, side="left"
+            base=x_bcn[:, :, :1], neighbor=x_bcn[:, :, 1:2], n=left, side="left"
         )
         right_vals = _linear_extrapolate(
-            base=x_d2[:, :, -1:], neighbor=x_d2[:, :, -2:-1], n=right, side="right"
+            base=x_bcn[:, :, -1:], neighbor=x_bcn[:, :, -2:-1], n=right, side="right"
         )
 
     else:
@@ -69,7 +70,7 @@ def input_nonperiodic_padding(
     parts = []
     if left > 0:
         parts.append(left_vals)
-    parts.append(x_d2)
+    parts.append(x_bcn)
     if right > 0:
         parts.append(right_vals)
     return torch.cat(parts, dim=-1)
