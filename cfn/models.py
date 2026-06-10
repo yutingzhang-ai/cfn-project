@@ -54,6 +54,7 @@ class ResidualBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.conv1(x)
         h = torch.tanh(h)
+        # h = F.silu(h)
         h = self.conv2(h)
         return h + x
 
@@ -127,6 +128,7 @@ class Flux(nn.Module):
         x_padded = self._pad(x)
         h = self.input_conv(x_padded)
         h = torch.tanh(h)
+        # h = F.silu(h)
         h = self.blocks(h)
         out = self.output_conv(h)
 
