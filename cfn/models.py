@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import math
 
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -197,17 +196,17 @@ _TORCH_WAVE_SPEEDS = {
 def _get_torch_wave_speed():
     """Return a torch-callable analogue of the active equation's wave_speed.
 
-    Known scalar laws use a native torch implementation. Anything else
-    (Whitham table lookup, Saint-Venant spectral radius) goes through the
-    numpy ``Equation.wave_speed``, with alpha treated as detached.
+    Traffic / Burgers / sine use a native torch implementation. Any other
+    equation (Whitham, Saint-Venant, ...) uses the same NumPy
+    ``Equation.wave_speed`` that ``cfn.solvers`` already calls, via a
+    detach-to-numpy round trip so alpha is treated as a frozen coefficient.
     """
-    eq = theoretical.active_equation()
-    torch_fn = _TORCH_WAVE_SPEEDS.get(eq.name)
+    torch_fn = _TORCH_WAVE_SPEEDS.get(theoretical.active_equation().name)
     if torch_fn is not None:
         return torch_fn
 
     def _from_numpy(u: torch.Tensor) -> torch.Tensor:
-        speed = np.asarray(eq.wave_speed(u.detach().cpu().numpy()))
+        speed = theoretical.active_equation().wave_speed(u.detach().cpu().numpy())
         out = torch.as_tensor(speed, device=u.device, dtype=u.dtype)
         while out.ndim < u.ndim:
             out = out.unsqueeze(-1)
