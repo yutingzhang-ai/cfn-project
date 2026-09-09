@@ -252,6 +252,7 @@ class CFN(nn.Module):
         right_padding: int = 3,
         boundary_mode: str = "extrapolate",
         n_components: int = 1,
+        num_blocks: int = 1,
         alpha_floor: float = 0.0,
     ):
         super().__init__()
@@ -266,6 +267,7 @@ class CFN(nn.Module):
             features,
             left_padding=left_padding,
             right_padding=right_padding,
+            num_blocks=num_blocks,
             boundary_mode=boundary_mode,
             n_components=n_components,
         )
