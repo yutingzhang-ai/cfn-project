@@ -27,7 +27,6 @@ import torch
 from cfn import theoretical
 from cfn.padding import input_circular_padding, input_nonperiodic_padding
 
-
 # ---------------------------------------------------------------------------
 # Rank normalization helpers (allow legacy [Nx] / [batch, Nx] scalar inputs)
 # ---------------------------------------------------------------------------

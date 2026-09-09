@@ -19,7 +19,7 @@ import torch.nn as nn
 import torch.optim as optim
 import yaml
 
-from cfn import CFN, train_CFN, theoretical
+from cfn import CFN, theoretical, train_CFN
 
 
 def parse_args() -> argparse.Namespace:

@@ -34,11 +34,12 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import torch
 import torch.nn as nn
 
-from cfn.padding import input_circular_padding, input_nonperiodic_padding
 from cfn import theoretical
+from cfn.padding import input_circular_padding, input_nonperiodic_padding
 
 
 class ResidualBlock(nn.Module):
@@ -196,11 +197,23 @@ _TORCH_WAVE_SPEEDS = {
 def _get_torch_wave_speed():
     """Return a torch-callable analogue of the active equation's wave_speed.
 
-    Falls back to a constant 1.0 if the active equation isn't in our table
-    (so the Rusanov dissipation still works, just with a conservative bound).
+    Known scalar laws use a native torch implementation. Anything else
+    (Whitham table lookup, Saint-Venant spectral radius) goes through the
+    numpy ``Equation.wave_speed``, with alpha treated as detached.
     """
-    eq_name = theoretical.active_equation().name
-    return _TORCH_WAVE_SPEEDS.get(eq_name, lambda u: torch.ones_like(u))
+    eq = theoretical.active_equation()
+    torch_fn = _TORCH_WAVE_SPEEDS.get(eq.name)
+    if torch_fn is not None:
+        return torch_fn
+
+    def _from_numpy(u: torch.Tensor) -> torch.Tensor:
+        speed = np.asarray(eq.wave_speed(u.detach().cpu().numpy()))
+        out = torch.as_tensor(speed, device=u.device, dtype=u.dtype)
+        while out.ndim < u.ndim:
+            out = out.unsqueeze(-1)
+        return out
+
+    return _from_numpy
 
 
 class CFN(nn.Module):

@@ -16,11 +16,9 @@ from __future__ import annotations
 import copy
 import math
 from pathlib import Path
-from typing import Callable
 
 import numpy as np
 import torch
-import torch.nn as nn
 
 from cfn.sampling import build_epoch_dataset
 
@@ -36,7 +34,7 @@ def _resolve_step_fn(model, integrator):
 
 def _rollout_loss(model, un, u_np1, loss_fn, *, k, margin, rollout_steps, integrator):
     step_fn = _resolve_step_fn(model, integrator)
-    loss = torch.tensor(0.0, device=un.device)
+    per_step_tensors = []
     um = un
     for target_id in range(rollout_steps):
         for _ in range(k):
@@ -47,8 +45,10 @@ def _rollout_loss(model, un, u_np1, loss_fn, *, k, margin, rollout_steps, integr
         else:
             pred = um
             target = u_np1[:, target_id, :, :]
-        loss = loss + loss_fn(pred, target)
-    return loss / rollout_steps
+        per_step_tensors.append(loss_fn(pred, target))
+    loss = torch.stack(per_step_tensors).mean()
+    per_step = [float(t.detach().item()) for t in per_step_tensors]
+    return loss, per_step
 
 
 def apply_model(model, un, u_np1, loss_fn, optimizer, *, is_training=True,
@@ -58,20 +58,23 @@ def apply_model(model, un, u_np1, loss_fn, optimizer, *, is_training=True,
 
     if is_training:
         optimizer.zero_grad()
-        loss = _rollout_loss(model, un, u_np1, loss_fn,
-                             k=k, margin=margin, rollout_steps=rollout_steps,
-                             integrator=integrator)
+        loss, per_step = _rollout_loss(
+            model, un, u_np1, loss_fn,
+            k=k, margin=margin, rollout_steps=rollout_steps,
+            integrator=integrator,
+        )
         loss.backward()
         if grad_clip is not None and grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
-        return float(loss.detach().item())
-    else:
-        with torch.no_grad():
-            loss = _rollout_loss(model, un, u_np1, loss_fn,
-                                 k=k, margin=margin, rollout_steps=rollout_steps,
-                                 integrator=integrator)
-        return float(loss.item())
+        return float(loss.detach().item()), per_step
+    with torch.no_grad():
+        loss, per_step = _rollout_loss(
+            model, un, u_np1, loss_fn,
+            k=k, margin=margin, rollout_steps=rollout_steps,
+            integrator=integrator,
+        )
+    return float(loss.item()), per_step
 
 
 def _make_fixed_validation_set(full_data, *, device,
@@ -128,16 +131,16 @@ def train_epoch(model, full_data, optimizer, loss_fn, *, device,
         u_np1_train = torch.tensor(data["un_p1"], dtype=torch.float32, device=device)
 
         model.train()
-        loss_t = apply_model(model, un_train, u_np1_train, loss_fn, optimizer,
-                             is_training=True, k=L, margin=margin,
-                             rollout_steps=rollout_steps, integrator=integrator,
-                             grad_clip=grad_clip)
+        loss_t, _ = apply_model(model, un_train, u_np1_train, loss_fn, optimizer,
+                                is_training=True, k=L, margin=margin,
+                                rollout_steps=rollout_steps, integrator=integrator,
+                                grad_clip=grad_clip)
         total_train += loss_t
 
     model.eval()
-    loss_v = apply_model(model, un_val, u_np1_val, loss_fn, optimizer,
-                         is_training=False, k=L, margin=margin,
-                         rollout_steps=rollout_steps, integrator=integrator)
+    loss_v, _ = apply_model(model, un_val, u_np1_val, loss_fn, optimizer,
+                            is_training=False, k=L, margin=margin,
+                            rollout_steps=rollout_steps, integrator=integrator)
 
     return total_train / num_draws, loss_v
 

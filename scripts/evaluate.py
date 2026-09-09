@@ -21,7 +21,6 @@ import yaml
 
 from cfn import CFN, theoretical
 
-
 # --- args / config -------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:

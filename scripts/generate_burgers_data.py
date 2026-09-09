@@ -42,7 +42,6 @@ from pathlib import Path
 
 import numpy as np
 
-
 # ----------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------
@@ -179,7 +178,7 @@ def main() -> None:
 
     num_ic = args.num_ic if args.ic == "random_sin" else 1
 
-    print(f"Scheme           : Engquist-Osher flux + TVD-RK3")
+    print("Scheme           : Engquist-Osher flux + TVD-RK3")
     print(f"IC               : {args.ic}  (num_ic={num_ic})")
     print(f"Domain           : [0, 2pi],  Nx={args.Nx},  dx={dx:.6e}")
     print(f"Viscosity nu     : {args.nu:.2e}  (0 = inviscid)")

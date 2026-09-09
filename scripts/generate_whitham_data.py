@@ -123,7 +123,7 @@ def main() -> None:
     snaps = np.empty((Nt_saved, args.Nx), dtype=np.float64)
     snaps[0] = u0
 
-    print(f"Whitham generator (Rusanov via cfn.solvers + TVD-RK3, extrapolate BCs)")
+    print("Whitham generator (Rusanov via cfn.solvers + TVD-RK3, extrapolate BCs)")
     print(f"  Nx={args.Nx}  dx={args.dx:.4f}  L={L_domain:.3f}")
     print(f"  IC               : {args.ic}  mean={args.mean}  amp={args.amp}")
     print(f"  IC range         : [{u0.min():.4f}, {u0.max():.4f}]  "

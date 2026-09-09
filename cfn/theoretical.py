@@ -26,7 +26,6 @@ from typing import Callable
 import numpy as np
 from scipy.special import ellipe, ellipk
 
-
 # ---------------------------------------------------------------------------
 # Whitham flux (elliptic-integral construction)
 # ---------------------------------------------------------------------------
@@ -55,11 +54,18 @@ def build_flux(num_points: int = 2 ** 16) -> tuple[np.ndarray, np.ndarray]:
 
 # Build once at import time; cheap and constant.
 _PHI_REF, _FLUX_REF = build_flux()
+_DFLUX_DPHI = np.gradient(_FLUX_REF, _PHI_REF)
 
 
 def flux_whitham(u: np.ndarray | float) -> np.ndarray | float:
     """Whitham theoretical flux via interpolation of the (phi, F) table."""
     return np.interp(u, _PHI_REF, _FLUX_REF, left=_FLUX_REF[0], right=_FLUX_REF[-1])
+
+
+def wave_speed_whitham(u: np.ndarray | float) -> np.ndarray | float:
+    """Local wave speed |F'(u)| from the Whitham interpolation table."""
+    deriv = np.interp(u, _PHI_REF, _DFLUX_DPHI, left=_DFLUX_DPHI[0], right=_DFLUX_DPHI[-1])
+    return np.abs(deriv)
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +76,11 @@ def flux_burgers(u: np.ndarray | float) -> np.ndarray | float:
     """Burgers flux F(u) = 0.5 u^2.  Derivative F'(u) = u."""
     u_arr = np.asarray(u, dtype=np.float64)
     return 0.5 * u_arr ** 2
+
+
+def wave_speed_burgers(u: np.ndarray | float) -> np.ndarray | float:
+    """Local wave speed |F'(u)| = |u| for Burgers."""
+    return np.abs(np.asarray(u, dtype=np.float64))
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +154,12 @@ def saint_venant_wave_speeds(
     return u - c, u + c
 
 
+def wave_speed_saint_venant(U: np.ndarray, g: float = _G_GRAVITY) -> np.ndarray:
+    """Rusanov spectral radius max(|u - sqrt(gh)|, |u + sqrt(gh)|)."""
+    lam_m, lam_p = saint_venant_wave_speeds(U, g=g)
+    return np.maximum(np.abs(lam_m), np.abs(lam_p))
+
+
 # ---------------------------------------------------------------------------
 # Equation registry
 # ---------------------------------------------------------------------------
@@ -159,9 +176,13 @@ class Equation:
     axis = ``n_components`` and returns the same. ``u_min``/``u_max``/``anchors``
     refer to a *representative* scalar quantity (e.g. depth ``h`` for
     Saint-Venant) for plotting and diagnostic purposes only.
+
+    ``wave_speed(u)`` is the local spectral radius used by the Rusanov
+    flux: ``|F'(u)|`` for scalar laws, ``max |lambda|`` for systems.
     """
     name: str
     flux: Callable[[np.ndarray], np.ndarray]
+    wave_speed: Callable[[np.ndarray], np.ndarray]
     u_min: float
     u_max: float
     anchors: tuple[float, ...]  # suggested anchor points for G-net
@@ -172,6 +193,7 @@ EQUATIONS: dict[str, Equation] = {
     "whitham": Equation(
         name="whitham",
         flux=flux_whitham,
+        wave_speed=wave_speed_whitham,
         u_min=0.66,
         u_max=0.88,
         anchors=(0.68, 0.72, 0.77, 0.82, 0.86),
@@ -179,6 +201,7 @@ EQUATIONS: dict[str, Equation] = {
     "burgers": Equation(
         name="burgers",
         flux=flux_burgers,
+        wave_speed=wave_speed_burgers,
         u_min=-1.0,
         u_max=1.0,
         anchors=(-0.8, -0.4, 0.0, 0.4, 0.8),
@@ -186,6 +209,7 @@ EQUATIONS: dict[str, Equation] = {
     "saint_venant": Equation(
         name="saint_venant",
         flux=flux_saint_venant,
+        wave_speed=wave_speed_saint_venant,
         # u_min/u_max here describe the depth h, not a scalar state.
         # Typical dam-break / Riemann problem ranges: h in [0.1, 2.0] m.
         u_min=0.1,
